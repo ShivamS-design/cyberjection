@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cyberjection"
+version = "0.1.0"
+description = "Enterprise-grade asynchronous LLM red-teaming and security orchestration framework"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Cyberjection Contributors" }]
+keywords = ["llm", "security", "red-team", "jailbreak", "ai-safety"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "litellm>=1.35",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+    "types-PyYAML",
+]
+
+[project.scripts]
+cyberjection = "apps.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cyberjection"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["cyberjection"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
