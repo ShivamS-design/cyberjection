@@ -32,13 +32,19 @@ pytest tests/unit/test_resumability_engine.py tests/unit/test_database_models.py
 module scope and skip cleanly if those packages aren't installed;
 `test_resumability_engine.py` has no such dependency and always runs.
 
+To run only the Phase 5 suite:
+
+```bash
+pytest tests/unit/test_attack_state.py tests/unit/test_attacker_agent.py tests/unit/test_crescendo_engine.py tests/unit/test_tap_pruning.py -v
+```
+
 ## Layout
 
 | File | Covers |
 |---|---|
 | `tests/unit/test_config_loader.py` | Environment-variable expansion (including the single-pass, non-recursive guarantee), YAML parsing errors, missing/malformed files, and end-to-end loading of `examples/quickstart.yaml`. |
 | `tests/unit/test_schema_validation.py` | Field-level constraints (ranges, required fields), duplicate-id rejection, cross-reference validation between tests and their targets/strategies, and independence of `default_factory` fields across instances. |
-| `tests/unit/test_litellm_provider.py` | The provider adapter: request construction, retry/backoff behavior, exception classification, concurrency limits, cancellation handling, and the token-bucket rate limiter. |
+| `tests/unit/test_litellm_provider.py` | The provider adapter: request construction, retry/backoff behavior, exception classification, concurrency limits, cancellation handling, the token-bucket rate limiter, and `generate_conversation` (Phase 5: multi-turn message replay, no injected system prompt, same rate limiter/semaphore as `generate`). |
 | `tests/unit/test_mutators.py` | Every concrete mutator's transformation logic, seeded reproducibility of the randomized mutators, and the alias registry (registration, collision handling, unknown-alias lookup). |
 | `tests/unit/test_mutator_pipeline.py` | `MutatorPipeline` chaining order, empty-pipeline passthrough, and that reordering mutators changes the output. |
 | `tests/unit/test_single_turn_attacks.py` | `DirectPromptInjectionStrategy`, `JailbreakStrategy`, and `SystemPromptExtractionStrategy` executed against a mocked `LiteLLMTarget`: framing, mutation-pipeline application, and `SingleTurnResult` population. |
@@ -49,6 +55,10 @@ module scope and skip cleanly if those packages aren't installed;
 | `tests/unit/test_resumability_engine.py` | The pure campaign-resumability reconciliation logic against plain stand-in objects: turn-number gap detection (resuming from the first missing turn, not `max + 1`), composite-key (`target_id`, `strategy`, `seed_prompt`) collision handling, and every `ResumeDecision` branch. Has no SQLAlchemy dependency and always runs. |
 | `tests/unit/test_database_models.py` | SQLAlchemy schema creation, `ON DELETE CASCADE` behavior through `DatabaseManager`'s per-connection pragma fix, the unique `(test_id, turn_number)` constraint, and the `MetricModel` one-to-one relationship. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise. |
 | `tests/unit/test_repository.py` | `CampaignRepository`: campaign/test lifecycle, `find_test`/`list_incomplete_tests` natural-key and execution-state queries, turn/finding recording, and metric accumulation via `upsert_metrics`. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise. |
+| `tests/unit/test_attack_state.py` | `ConversationContext` memory (`add_turn`, `pop_last_turn`), the attack-tree node index (`add_node`, `path_to`, cyclic-parent-chain safety, `best_score`), and `score_from_evaluation`'s mapping from Phase 3's `Verdict`/confidence onto Phase 5's 0-10 attack-progress scale. |
+| `tests/unit/test_attacker_agent.py` | `AttackerAgent`: structured JSON parsing, goal interpolation, conversation-history forwarding, and retry-then-`AttackerGenerationError` behavior on malformed JSON, empty responses, and missing required fields. |
+| `tests/unit/test_crescendo_engine.py` | `CrescendoEngine.run()`: exactly one `AttackNode` yielded per turn (including the backtrack-turn regression case), state-rollback correctness (a backtracked turn's exchange is absent from what's next sent to the target), `REFUSED` vs `BACKTRACK` status selection based on remaining backtrack budget, success short-circuiting before `max_turns`, and graceful termination on attacker failure. |
+| `tests/unit/test_tap_pruning.py` | `TAPEngine.execute_tree_search()`: pruning below/above the score threshold, multi-depth expansion (the loop-nesting regression case), returning the best partial path when nothing succeeds, and fault tolerance when an individual branch's attacker call fails via `asyncio.gather(return_exceptions=True)`. |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions
@@ -67,6 +77,15 @@ module scope and skip cleanly if those packages aren't installed;
   are intentional white-box checks confirming that permits are released
   correctly under both success and failure paths -- not just that the
   public API returns the right value.
+- Phase 5's multi-turn engine tests (`test_crescendo_engine.py`,
+  `test_tap_pruning.py`) use lightweight duck-typed test doubles for the
+  target, evaluator, and attacker rather than real `LiteLLMTarget` /
+  `CascadeEvaluator` / `AttackerAgent` instances, since the engines only
+  call three narrow async methods on each (`generate_conversation`,
+  `evaluate`, `generate_next_payload`). This keeps the engine-logic tests
+  fast and focused on control flow, while `test_litellm_provider.py` and
+  `test_attacker_agent.py` separately cover the real classes' own behavior
+  in isolation.
 
 ## Adding a new provider or config field
 
@@ -144,3 +163,23 @@ module scope and skip cleanly if those packages aren't installed;
    `tests/unit/test_resumability_engine.py` using a plain
    `types.SimpleNamespace` stand-in, so the test keeps running without
    SQLAlchemy installed.
+
+## Adding a new multi-turn attack engine
+
+1. Implement the engine in a new module under `cyberjection/attacks/`,
+   taking a `CascadeEvaluator` and an `AttackerAgent` (or any object
+   duck-typing their `.evaluate()` / `.generate_next_payload()` methods)
+   rather than constructing them internally, so tests can substitute fast
+   doubles.
+2. Convert evaluator output to attack-progress terms via
+   `cyberjection.attacks.state.score_from_evaluation` rather than
+   inventing a second conversion -- see that function's docstring for why
+   Phase 3's `Verdict`/confidence and Phase 5's 0-10 score/`is_refusal`
+   shapes don't line up on their own.
+3. Record every explored state as an `AttackNode` via
+   `ConversationContext.add_node`, linking `parent_id` correctly across any
+   backtracking or branch-pruning the engine does, so `path_to()` can
+   reconstruct a coherent trajectory afterward.
+4. Add a dedicated test module using the `FakeTarget` / `FakeEvaluator` /
+   `ScriptedAttacker` (or equivalent) pattern established in
+   `test_crescendo_engine.py` and `test_tap_pruning.py`.

@@ -286,6 +286,90 @@ written as real `pytest-asyncio` tests against a real async engine for CI to
 run once the dependencies are installed; they self-skip via
 `pytest.importorskip` rather than failing where they aren't.
 
+## Phase 5: Stateful Multi-Turn Adaptive Attack Engine
+
+Builds the multi-turn attack core on top of the Phase 1 target gateway and
+the Phase 3 cascade evaluator: rather than a single scored request/response
+pair, an attack is now a growing, possibly-branching conversation that
+escalates or backtracks based on the evaluator's read of each exchange.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/attacks/state.py` | `TurnStatus`, `AttackNode` (a scored conversational state node), `ConversationContext` (live message history plus a parallel, backtrack-resilient attack-tree node index), and `score_from_evaluation` (the Phase 3 -> Phase 5 score adapter, see below). |
+| `cyberjection/attacks/attacker.py` | `AttackerAgent`: a dedicated generator LLM that analyzes the target's latest response and formulates the next adversarial follow-up prompt as structured JSON. |
+| `cyberjection/attacks/crescendo.py` | `CrescendoEngine`: incremental foot-in-the-door escalation across a bounded number of turns, with automatic backtracking out of hard refusals. |
+| `cyberjection/attacks/tap.py` | `TAPEngine`: Tree-of-Attacks-with-Pruning breadth-first branching search, exploring multiple candidate follow-ups per branch and pruning unproductive ones. |
+
+### The attack tree: live history vs. the node index
+
+`ConversationContext` deliberately keeps two structures rather than one:
+`history` (the flat message list actually replayed to models) and `nodes`
+(a `node_id -> AttackNode` index linked by `parent_id`). A backtrack
+(`pop_last_turn`) strips a refused exchange from `history` -- the target's
+live memory genuinely forgets it happened -- but the corresponding
+`AttackNode` stays in `nodes`, so the attempt is never lost from the
+attack's audit trail. `path_to(node_id)` walks the `parent_id` chain back
+to the root, reconstructing any node's full trajectory on demand; this is
+what makes `nodes` function as an actual *tree* (branch-aware, as TAP
+needs) rather than a flat list (all Crescendo needs, since it never
+branches).
+
+### Bridging Phase 3's verdict to a Phase 5 attack-progress score
+
+Phase 3's `EvaluationOutcome` carries a `Verdict` (`PASS`/`FAIL`/
+`UNCERTAIN`) and a `confidence` in `[0.0, 1.0]`. Phase 5's engines are
+built around a 0-10 attack-progress score and a refusal flag instead.
+`score_from_evaluation` is the single adapter both `CrescendoEngine` and
+`TAPEngine` call to bridge the two: `Verdict.FAIL` (the target was
+jailbroken) maps to a high score scaled by confidence; `Verdict.PASS` (the
+target safely resisted) maps to a low score and `is_refusal=True`;
+`Verdict.UNCERTAIN` scores conservatively in the low-middle of the range
+without asserting a refusal happened. Centralizing this in one function
+(rather than letting each engine grow its own conversion) is what keeps
+Crescendo's and TAP's success/pruning thresholds comparable to each other.
+
+### Crescendo: escalation with backtracking
+
+`CrescendoEngine.run()` is an async generator yielding exactly one
+`AttackNode` per turn attempted. Each turn is classified into one of four
+`TurnStatus` values: `SUCCESS` (score at or above `success_threshold`,
+which ends the generator), `BACKTRACK` (a refusal was detected and the
+backtrack budget isn't exhausted -- `ConversationContext.pop_last_turn()`
+strips the refused exchange from what's sent to the target on the next
+turn), `REFUSED` (a refusal was detected but the backtrack budget is
+exhausted, so the refusal is recorded but conversation memory is left
+intact), or `PROGRESSING` (neither). A backtracked node's `parent_id`
+bookkeeping is careful to keep pointing at the last *surviving* parent, not
+the rolled-back node itself, since the rolled-back node's context no
+longer exists in the live conversation.
+
+### TAP: breadth-first tree search with pruning
+
+`TAPEngine.execute_tree_search()` expands every surviving branch at each
+depth level before moving to the next (a genuine breadth-first search,
+depth by depth), asking the attacker for `branching_factor` candidate
+follow-ups per branch via `asyncio.gather(..., return_exceptions=True)` so
+one failed attacker call only prunes that one candidate rather than
+aborting the whole search. A branch survives to the next depth only if its
+score is at or above `pruning_threshold`; the moment any branch reaches
+`success_threshold`, the search returns that branch's full root-to-leaf
+path immediately. If `max_depth` is exhausted without a success, the
+search returns the highest-scoring path actually explored (breaking ties
+on depth, deeper wins) rather than an empty result, so a failed search
+still reports how close the attack got.
+
+### Cost and orchestration status
+
+Neither engine enforces `CampaignConfig.max_cost_cap` or is wired to
+`StrategyConfig.max_turns` from campaign YAML yet -- both are constructed
+directly in Python for now, the same interim state Phase 2's mutator
+pipeline and Phase 3's cascade evaluator shipped in before their respective
+orchestrator wiring landed. `TAPEngine`'s branch count grows as
+`branching_factor ** depth`, so a full unpruned search under the defaults
+(`branching_factor=3`, `max_depth=5`) can reach several hundred target +
+attacker + evaluator calls; `pruning_threshold` is the only cost control
+until campaign-level budget wiring exists.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -293,8 +377,8 @@ run once the dependencies are installed; they self-skip via
 | 1 | Core async architecture, declarative configuration, target abstraction gateway |
 | 2 | Mutation engine (Base64, Homoglyph, Typoglycemia, Unicode zero-width, ROT13/Caesar) & single-turn attack generators (direct injection, jailbreak/roleplay, system prompt extraction) |
 | 3 | Three-tier cascade evaluation pipeline (regex -> local ONNX -> LLM judge) |
-| 4 (current) | Persistence layer, SQLAlchemy database models, campaign resumability |
-| 5 | Stateful multi-turn adaptive attack engine (Crescendo, PAIR, TAP) |
+| 4 | Persistence layer, SQLAlchemy database models, campaign resumability |
+| 5 (current) | Stateful multi-turn adaptive attack engine (Crescendo, TAP) |
 | 6 | Command-line interface (Typer + Rich) |
 | 7 | FastAPI REST backend & async task queue (Redis + Celery/Dramatiq) |
 | 8 | React web dashboard & real-time monitoring console |
@@ -321,16 +405,26 @@ silently duplicated on a racy resume) and `tests` indexes
 above. Every foreign key cascades on delete: removing a campaign removes
 its tests, turns, findings, and metrics with it.
 
+The Phase 5 attack tree (`ConversationContext.nodes` / `AttackNode`) is not
+yet persisted through this schema -- `TurnModel` records a single
+prompt/response pair per turn number, while an `AttackNode` additionally
+carries score, status, and tree-branching (`parent_id`) that don't have a
+column home yet. Wiring multi-turn attack trees into the persistence layer
+is orchestrator work reserved for a later phase.
+
 ## Threat model summary
 
 | Risk | Mitigation |
 |---|---|
 | Credential exposure via hardcoded API keys or logs | Environment-variable expansion keeps secrets out of YAML files; secret values are wrapped in `SecretStr` and never appear in reprs or logs. |
 | Malicious payload execution via custom plugins (Phase 10) | Sandboxed plugin runtimes and strict input validation, planned for the plugin architecture phase. |
-| Unbounded resource exhaustion from runaway multi-turn loops | `max_cost_cap` circuit breaker and `max_turns` bound (<= 25) enforced at the schema level. |
+| Unbounded resource exhaustion from runaway multi-turn loops | `max_cost_cap` circuit breaker and `max_turns` bound (<= 25) enforced at the schema level; `TAPEngine.pruning_threshold` bounds branch survival until cost-cap wiring lands. |
 
 For air-gapped deployments, Tier 1 (regex) and Tier 2 (local ONNX)
 evaluation, plus a local Ollama or vLLM target, allow fully offline
 operation: skip `LLMJudgeEvaluator` (or set `confidence_threshold` low
 enough on Tier 2 that Tier 3 is never reached) to keep every evaluation
-on-box.
+on-box. `AttackerAgent` still requires a real LLM call by design (it's the
+part of the system generating adversarial creativity), so fully offline
+multi-turn campaigns need a local model served through Ollama/vLLM
+configured as the attacker's `model`.

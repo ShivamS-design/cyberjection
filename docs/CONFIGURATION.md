@@ -70,7 +70,7 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `type` | string | required | e.g. `single_turn`, `adaptive`. |
 | `converters` | list[str] | `[]` | Mutator aliases applied to prompts, in order, via `cyberjection.mutators.build_pipeline`. See [Mutators](#mutators). |
 | `max_turns` | int | `1` | `1-25`, enforcing the multi-turn depth guardrail. |
-| `attacker_model` | string | optional | Model used to generate adaptive attack prompts (Phase 5+). |
+| `attacker_model` | string | optional | Model used to generate adaptive attack prompts (Phase 5). |
 
 ## `AssertionConfig`
 
@@ -172,6 +172,54 @@ instances to override any of them (e.g. a custom `judge_model`, or a
 evaluator's `.evaluate()` and the cascade's own `.evaluate()` are safe to
 call concurrently on a shared instance -- no mutable state is held on
 `self` during evaluation.
+
+## Persistence
+
+`cyberjection.persistence` (Phase 4) provides an async SQLite-backed store
+for campaign/test/turn/finding/metric data, independent of the campaign
+YAML schema above:
+
+```python
+from cyberjection.persistence import CampaignRepository, DatabaseManager
+
+db = DatabaseManager()  # sqlite+aiosqlite:///.cyberjection/results.db by default
+await db.init_db()
+async with db.session() as session:
+    repo = CampaignRepository(session)
+    campaign = await repo.create_campaign("nightly-run")
+```
+
+The database URL can be overridden via the `CYBERJECTION_DB_URL`
+environment variable when running Alembic migrations (`alembic upgrade
+head`); see `alembic/env.py`. `CampaignConfig` fields aren't yet wired to
+automatically construct a `DatabaseManager` -- that's orchestrator work
+reserved for a later phase.
+
+## Multi-turn attack engines
+
+`cyberjection.attacks` (Phase 5) provides two stateful multi-turn engines,
+both scored via the Phase 3 `CascadeEvaluator`:
+
+```python
+from cyberjection.attacks import AttackerAgent, CrescendoEngine, TAPEngine
+from cyberjection.evaluators import CascadeEvaluator
+
+attacker = AttackerAgent(model="openai/gpt-4o-mini")
+evaluator = CascadeEvaluator()
+
+crescendo = CrescendoEngine(evaluator=evaluator, attacker=attacker, max_turns=10, max_backtracks=5)
+tap = TAPEngine(evaluator=evaluator, attacker=attacker, branching_factor=3, max_depth=5)
+```
+
+| Engine | Constructor options | Notes |
+|---|---|---|
+| `CrescendoEngine` | `max_turns` (default `10`), `max_backtracks` (default `5`), `success_threshold` (default `8.0`) | `run(target, goal, initial_prompt)` is an async generator yielding one `AttackNode` per turn attempted. |
+| `TAPEngine` | `branching_factor` (default `3`), `max_depth` (default `5`), `pruning_threshold` (default `3.0`), `success_threshold` (default `8.0`) | `execute_tree_search(target, goal, seed_prompt)` returns the winning (or best-explored) root-to-leaf `List[AttackNode]`. |
+
+Neither engine is yet wired to `StrategyConfig.max_turns` or campaign YAML;
+both are constructed directly in Python for now, the same interim state
+Phase 2's mutator pipeline and Phase 3's cascade evaluator shipped in
+before orchestrator wiring landed.
 
 ## Full example
 
