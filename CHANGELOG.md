@@ -2,6 +2,93 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - Phase 4: Persistence Layer, Database Models & Resumability Engine
+
+### Added
+
+- SQLAlchemy 2 declarative schema (`cyberjection/persistence/models.py`,
+  `Mapped`/`mapped_column` style): `CampaignModel`, `TestModel`,
+  `TurnModel`, `FindingModel`, `MetricModel`. Includes a unique
+  `(test_id, turn_number)` index on `turns`, a composite
+  `(campaign_id, target_id, strategy)` index on `tests` to support
+  resumability lookups, and `ON DELETE CASCADE` on every foreign key.
+- `DatabaseManager` (`cyberjection/persistence/sqlite.py`): async SQLite
+  engine/session factory (`aiosqlite`), WAL journal mode, schema creation
+  with automatic parent-directory creation, and an `in_memory()` classmethod
+  (`StaticPool`-backed) for tests.
+- `CampaignRepository` (`cyberjection/persistence/repository.py`): the DAO
+  for campaign/test lifecycle, turn/finding/metric recording, and the
+  execution-state queries (`list_incomplete_tests`, `get_campaign_with_tests`,
+  `get_test_with_history`, ...) resumability and reporting need. Every
+  mutating method commits immediately, so a checkpoint is durable the
+  instant it's written rather than batched.
+- Campaign resumability (`cyberjection/persistence/resumability.py`):
+  `build_resume_map` / `reconcile_test_state` / `decide_resume_action`, a
+  pure reconciliation algorithm with no SQLAlchemy dependency, plus
+  `ResumabilityManager`, the thin database-facing wrapper around it. Resume
+  state is keyed by the composite `(target_id, strategy, seed_prompt)`
+  natural key, and a partially-completed test resumes from the lowest
+  missing turn number rather than trusting `max(turn_numbers) + 1`.
+- Alembic migrations: a hand-authored initial migration
+  (`alembic/versions/0001_initial_schema.py`) mirroring `models.py`
+  field-by-field, and an async-engine-compatible `alembic/env.py` that runs
+  migrations through `connection.run_sync(...)` inside `asyncio.run(...)`
+  rather than a second, synchronous engine.
+- Unit test suite: `tests/unit/test_resumability_engine.py` (pure-function
+  tests against plain stand-in objects -- turn gap detection, composite-key
+  collision handling, and every `ResumeDecision` branch) plus
+  `tests/unit/test_database_models.py` and `tests/unit/test_repository.py`
+  (real `pytest-asyncio` tests against a real async engine, self-skipping
+  via `pytest.importorskip` where SQLAlchemy isn't installed).
+
+### Fixed
+
+- SQLite's `PRAGMA foreign_keys` and `PRAGMA synchronous` are per-connection
+  session state that resets to SQLite's defaults (`foreign_keys` OFF) on
+  every new pooled connection, unlike `journal_mode`, which persists in the
+  database file. Setting these once at startup inside a single
+  `engine.begin()` block -- the naive approach -- silently leaves
+  `ON DELETE CASCADE` disabled on every connection the pool hands out
+  afterward. Verified with a standalone `sqlite3` script before writing any
+  ORM code (orphaned rows without the pragma, clean cascade with it). Fixed
+  with a `sqlalchemy.event.listens_for(engine.sync_engine, "connect")`
+  listener in `DatabaseManager` that re-applies both pragmas on every new
+  connection, not just the first.
+- The originally sketched resumability lookup keyed persisted test state by
+  `seed_prompt` alone, which silently collides whenever two test cases in
+  the same campaign share a seed_prompt but differ in target or strategy --
+  a realistic, explicitly supported configuration (e.g. one seed prompt run
+  against several targets). Caught during design review, before any code
+  depended on the seed_prompt-only key. Fixed by keying on the full
+  `(target_id, strategy, seed_prompt)` composite instead, with an explicit
+  `ResumabilityKeyCollisionError` for the one case that's still genuinely
+  ambiguous (two config entries with an identical full triple).
+- `SQLite doesn't create missing parent directories for a file-based
+  database`: `DatabaseManager.init_db()` now creates the database file's
+  parent directory before the engine's first connection, rather than
+  failing on a fresh checkout with no `.cyberjection/` directory yet.
+
+### Known limitations
+
+- This sandbox has no network access to install SQLAlchemy, aiosqlite, or
+  Alembic, so the ORM-dependent test suites
+  (`test_database_models.py`, `test_repository.py`) could not be executed
+  here; they're written as real tests for CI to run once the dependencies
+  are installed, and self-skip cleanly rather than failing in the meantime.
+  What *was* verified directly in this environment: the SQLite pragma and
+  cascade-delete semantics via stdlib `sqlite3`, the hand-authored Alembic
+  migration's actual `upgrade()`/`downgrade()` functions executed against a
+  real (if minimally shimmed) `sqlite3` connection, and the full
+  resumability reconciliation algorithm via genuine offline unit tests.
+- `CampaignRepository` and `ResumabilityManager` are not yet wired into an
+  orchestrator loop -- that wiring, along with the worker pool that will
+  call them per-turn, is Phase 5+ scope. They're complete and tested as a
+  standalone persistence API for now.
+- `LocalONNXGuardEvaluator`'s judge tier and evaluation results aren't yet
+  automatically persisted via `MetricModel.judge_tier_used`; callers wire
+  `CascadeEvaluator` outcomes into `CampaignRepository.upsert_metrics`
+  manually until the orchestrator lands.
+
 ## [0.3.0] - Phase 3: 3-Tier Cascade Evaluation Pipeline
 
 ### Added

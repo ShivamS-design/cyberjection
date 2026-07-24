@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cyberjection"
-version = "0.3.0"
+version = "0.4.0"
 description = "Enterprise-grade asynchronous LLM red-teaming and security orchestration framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +24,10 @@ dependencies = [
     "litellm>=1.35",
     "typer>=0.12",
     "rich>=13.7",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
+    "greenlet>=3.0",
 ]
 
 [project.optional-dependencies]
