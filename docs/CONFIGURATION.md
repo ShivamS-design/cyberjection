@@ -294,6 +294,54 @@ threshold)` is the pure decision function both the CLI and any future
 caller should use rather than re-deriving pass/fail inline: a finding
 scores at or above `threshold` fails the gate.
 
+## Distributed worker architecture
+
+`cyberjection.distributed` (Phase 7) is not driven by campaign YAML --
+none of its settings live on `CampaignConfig`, since nothing in the
+codebase yet decides whether a campaign runs locally or dispatches to the
+distributed queue (see the Phase 7 changelog entry's Known Limitations).
+Configuration is environment-variable-driven instead, matching the
+`CYBERJECTION_DB_URL` convention `cyberjection.persistence.sqlite` already
+uses:
+
+| Environment variable | Default | Used by |
+|---|---|---|
+| `CYBERJECTION_CELERY_BROKER_URL` | `redis://localhost:6379/0` | `cyberjection/distributed/celery_app.py`: the Celery broker connection. |
+| `CYBERJECTION_CELERY_RESULT_BACKEND_URL` | `redis://localhost:6379/1` | `cyberjection/distributed/celery_app.py`: the Celery result backend. Deliberately a different logical Redis database than the broker, so a single `redis-server` instance can serve both without broker traffic and result storage colliding. |
+| `CYBERJECTION_CELERY_CONCURRENCY` | `4` | `cyberjection/distributed/celery_app.py`: `worker_concurrency`, the number of task slots a single worker process runs. |
+
+`DistributedRateLimiter` and `DistributedClusterCoordinator` are
+constructed directly with a `redis_url` and (for the limiter)
+`provider_id`/`max_rpm`/`max_tpm` -- there's no environment-variable
+default for these since they're meant to be scoped per target provider,
+following whatever a future orchestrator integration passes in from a
+target's own config.
+
+```python
+from cyberjection.distributed.rate_limiter import DistributedRateLimiter
+from cyberjection.distributed.coordinator import DistributedClusterCoordinator
+
+limiter = DistributedRateLimiter(
+    redis_url="redis://localhost:6379/0",
+    provider_id="openai",
+    max_rpm=60,
+    max_tpm=90_000,
+)
+await limiter.acquire(request_cost=1, token_cost=350)
+
+coordinator = DistributedClusterCoordinator(redis_url="redis://localhost:6379/0")
+await coordinator.broadcast_if_failing(test_case_id, verdict)
+```
+
+Running the distributed components against a real cluster requires the
+`redis` and `celery` packages (both hard dependencies -- see
+`pyproject.toml`) and a reachable Redis instance:
+
+```bash
+docker run -d --name cyberjection-redis -p 6379:6379 redis:alpine
+celery -A cyberjection.distributed.celery_app worker --loglevel=info
+```
+
 ## Full example
 
 See [`examples/quickstart.yaml`](../examples/quickstart.yaml) for a

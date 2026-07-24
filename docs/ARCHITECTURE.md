@@ -435,6 +435,63 @@ real orchestrated run later is a body replacement, not an interface
 change for every caller (the CLI, and any future orchestrator entrypoint)
 that already depends on it.
 
+## Phase 7: Distributed Worker Architecture, Task Queues & Rate Limiting Engine
+
+Scales evaluation from a single process to a horizontal pool of worker
+nodes coordinating through shared Redis state, so a large campaign can be
+split across a cluster instead of bottlenecking on one machine's CPU and
+one process's view of each provider's rate limits.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/distributed/celery_app.py` | The shared `celery_app` Celery application: Redis broker/backend, JSON serialization, late ack, bounded prefetch. |
+| `cyberjection/distributed/rate_limiter.py` | `DistributedRateLimiter`: atomic Redis-backed RPM + TPM token bucket per provider, cluster-wide. `evaluate_dual_bucket()` is the pure-Python algorithm mirror. |
+| `cyberjection/distributed/coordinator.py` | `DistributedClusterCoordinator`: Redis Pub/Sub abort broadcast/listen, wired to `Verdict.FAIL`. |
+| `cyberjection/distributed/retry.py` | `compute_backoff_delay()` (pure exponential backoff with jitter) and dead-letter-queue helpers. |
+| `cyberjection/distributed/tasks.py` | `execute_eval_turn_task`: the Celery task wrapping one evaluation turn, rate-limited, retried, dead-lettered on exhaustion. |
+
+### One atomic Lua script covers both buckets, not two separate checks
+
+A provider commonly enforces requests-per-minute *and* tokens-per-minute
+limits independently. Checking and debiting two separate Redis keys with
+two separate round trips would leave a window between them where a
+request could pass the RPM check, then fail the TPM check, having already
+consumed an RPM token for a request that overall never went through.
+`DUAL_TOKEN_BUCKET_LUA` evaluates and debits both buckets inside one
+`EVALSHA` call, so a request is admitted or rejected as a single atomic
+unit -- if either bucket is short, neither is touched.
+
+### Rate-limiter capacity guard
+
+A request for more units than a bucket's own configured capacity can
+never be satisfied, since a bucket's level is capped at its maximum. The
+design spec's own `acquire()` sketch had no such guard and would loop
+forever sleeping on a request shaped like that. `DistributedRateLimiter.acquire()`
+checks `request_cost`/`token_cost` against the configured maximums up
+front and raises `RateLimitCapacityExceededError` immediately instead.
+
+### Fault tolerance: retry with backoff, then dead-letter
+
+`execute_eval_turn_task` catches any exception from its work, computes a
+jittered exponential backoff (`compute_backoff_delay`), and calls
+`self.retry()`. Once `self.retry()` itself raises `MaxRetriesExceededError`
+(retry budget exhausted), the task pushes a JSON record of the failure --
+task name, id, arguments, error type/message, and how many retries were
+attempted -- onto a durable Redis list (the dead-letter queue) before
+re-raising, so a permanently-failing task leaves a record an operator can
+inspect and replay rather than silently vanishing into a Celery FAILURE
+result nobody's watching.
+
+### Not yet wired into the orchestrator
+
+Same status as the Phase 4 persistence layer before Phase 5 wired
+resumability into anything, and the Phase 6 CLI's still-stubbed
+`_execute_pipeline()`: `cyberjection/distributed/` ships as a complete,
+independently-tested subsystem, but nothing in this phase decides *when*
+a campaign should dispatch to the distributed queue instead of running
+locally. See [Cost and orchestration status](#cost-and-orchestration-status)
+and the Known Limitations section of the Phase 7 changelog entry.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -444,11 +501,11 @@ that already depends on it.
 | 3 | Three-tier cascade evaluation pipeline (regex -> local ONNX -> LLM judge) |
 | 4 | Persistence layer, SQLAlchemy database models, campaign resumability |
 | 5 | Stateful multi-turn adaptive attack engine (Crescendo, TAP) |
-| 6 (current) | CI/CD pipeline integration, CLI harness (Typer + Rich), enterprise reporting (SARIF, JSON, Markdown) |
-| 7 | FastAPI REST backend & async task queue (Redis + Celery/Dramatiq) |
-| 8 | React web dashboard & real-time monitoring console |
-| 9 | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack |
-| 10 | Plugin architecture, security hardening, container deployment |
+| 6 | CI/CD pipeline integration, CLI harness (Typer + Rich), enterprise reporting (SARIF, JSON, Markdown) |
+| 7 (current) | Distributed worker architecture: Celery + Redis task queues, atomic cluster-wide RPM/TPM rate limiting, Pub/Sub abort coordination, retry/dead-letter fault tolerance |
+| 8 | Security auditing, compliance & production hardening |
+| 9 | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack (and, per Phase 7, optionally the distributed queue) |
+| 10 | Plugin architecture, web dashboard, container deployment |
 
 ## Data model
 

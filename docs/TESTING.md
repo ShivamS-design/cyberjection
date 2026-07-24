@@ -53,6 +53,23 @@ use for `sqlalchemy` -- in an environment with neither `typer` nor a
 compatible offline shim on `sys.path`, it skips cleanly rather than
 failing collection.
 
+To run only the Phase 7 suite:
+
+```bash
+pytest tests/unit/test_rate_limiter.py tests/unit/test_retry.py tests/unit/test_coordinator.py tests/unit/test_distributed_tasks.py -v
+```
+
+Unlike the Phase 4/6 suites above, none of these four files
+`pytest.importorskip` -- `redis` and `celery` are hard dependencies (see
+`pyproject.toml`), and `test_rate_limiter.py`/`test_coordinator.py`/
+`test_distributed_tasks.py` exercise `DistributedRateLimiter`,
+`DistributedClusterCoordinator`, and the Celery task directly through the
+real `redis.asyncio`/`celery` import surface. Running them against a real
+deployment requires a reachable Redis instance (`docker run -d --name
+cyberjection-redis -p 6379:6379 redis:alpine`, matching the Phase 7 spec's
+own prerequisite); `test_retry.py`'s pure backoff/payload-builder tests
+need neither Redis nor Celery and always run.
+
 ## Layout
 
 | File | Covers |
@@ -78,6 +95,10 @@ failing collection.
 | `tests/unit/test_sarif_exporter.py` | `SARIFReporter`: structural validation against a locally-authored minimal SARIF 2.1.0 schema, rule-catalog deduplication for a repeated `rule_id`, and threshold-relative severity levels (both regression coverage for bugs in the Phase 6 design spec's own sketch). |
 | `tests/unit/test_exporters.py` | `JSONExporter` (summary block correctness, `Finding` round-trip via `model_validate`) and `MarkdownExporter` (pass/fail header, per-finding table rows, pipe-character escaping). |
 | `tests/unit/test_quality_gate.py` | `resolve_threshold`'s CLI > config > default precedence (including that an explicit `0.0` at either level is not treated as "missing") and `evaluate_quality_gate`'s pass/fail/exactly-at-threshold decision, independent of any CLI or Typer machinery. |
+| `tests/unit/test_rate_limiter.py` | `evaluate_dual_bucket` pure-function edge cases (empty bucket, exact-boundary requests, refill saturation, zero elapsed time, RPM-ok-but-TPM-short rejection, no-partial-debit-on-rejection) and `DistributedRateLimiter.acquire()` integration: capacity guards, actual TPM enforcement, shared state across two instances on the same Redis URL, and a 50-way concurrent `acquire()` race against a 10-unit bucket proving atomicity. |
+| `tests/unit/test_retry.py` | `compute_backoff_delay`'s exponential growth, jitter injection (with a deterministic injected `rng`), capping, and input validation; `build_dead_letter_payload`'s JSON-serializability and field population. No Redis/Celery dependency. |
+| `tests/unit/test_coordinator.py` | `DistributedClusterCoordinator`: abort broadcast reaching a subscribed listener, a pre-subscription broadcast being a silent no-op, channel isolation between differently-named coordinators on the same Redis instance, pubsub connection cleanup after listening (regression test for a connection leak in the design spec's own sketch), and `broadcast_if_failing`'s `Verdict.FAIL`-only trigger condition. |
+| `tests/unit/test_distributed_tasks.py` | `execute_eval_turn_task`: successful completion, rate-limit enforcement, transient-failure retry-then-succeed, exhausted-retry `MaxRetriesExceededError`, retry count bounded by `MAX_RETRIES`, dead-letter-queue push on exhaustion (and never on success), and per-target rate-limiter instance caching. |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions
@@ -234,3 +255,32 @@ failing collection.
    `tests/unit/test_quality_gate.py` rather than only testing it through
    the CLI -- `evaluate_quality_gate`/`resolve_threshold` are meant to stay
    testable independent of Typer.
+
+## Adding a new distributed task or coordination signal
+
+1. Define the task in `cyberjection/distributed/tasks.py` with
+   `@celery_app.task(bind=True, max_retries=..., default_retry_delay=...)`,
+   calling `DistributedRateLimiter.acquire()` (via the `_get_rate_limiter`
+   cache, not a fresh instance per call) before any external API request.
+2. Wrap the task body's real work in a `try`/`except`, computing a
+   `compute_backoff_delay(self.request.retries)` countdown and calling
+   `raise self.retry(exc=exc, countdown=countdown)` on transient failure.
+   Catch `MaxRetriesExceededError` around that `self.retry()` call and
+   push to the dead-letter queue via `push_to_dead_letter_queue` before
+   re-raising -- see `execute_eval_turn_task` for the exact shape.
+3. If the new logic has a pure-math or pure-data-shape component (a new
+   backoff variant, a new DLQ payload field), factor it into
+   `cyberjection/distributed/retry.py` as a standalone function so it can
+   be hard-tested without Celery or Redis, following `compute_backoff_delay`
+   and `build_dead_letter_payload`.
+4. For a new cluster-wide coordination signal (beyond abort), add a method
+   to `DistributedClusterCoordinator` following `broadcast_abort`'s
+   publish-a-JSON-payload shape, and a corresponding `listen_for_*` that
+   subscribes, `try`/`finally`-cleans-up the pubsub connection, and returns
+   the parsed payload -- see the module docstring for why Pub/Sub (not the
+   Celery queue itself) is the right primitive for a broadcast.
+5. Add test coverage to `tests/unit/test_distributed_tasks.py` or
+   `tests/unit/test_coordinator.py` using a `monkeypatch`-installed stub for
+   whatever async work the task/signal wraps (see `_install_failing_stub`
+   in `test_distributed_tasks.py`), so retry/backoff/DLQ paths can be
+   exercised deterministically without waiting on real countdowns.
