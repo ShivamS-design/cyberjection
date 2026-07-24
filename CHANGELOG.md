@@ -2,6 +2,65 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - Phase 2: Mutation Engine & Single-Turn Attack Generators
+
+### Added
+
+- `BaseMutator` abstract interface and `MutatorPipeline` chaining engine
+  (`cyberjection/mutators/base.py`): mutators are applied strictly in list
+  order, each consuming the previous mutator's output.
+- Dynamic mutator registry (`cyberjection/mutators/registry.py`):
+  `register_mutator`, `get_mutator`, `list_mutator_aliases`,
+  `build_pipeline`, so mutator chains can be declared as plain alias
+  strings (e.g. in `StrategyConfig.converters`) instead of importing
+  concrete classes. Registering a different class under an alias already
+  in use raises `MutatorRegistrationError` rather than silently shadowing
+  it; re-registering the same class is idempotent.
+- Five concrete mutators, each registered under a short alias:
+  `Base64Mutator` (`base64`), `HomoglyphMutator` (`homoglyph`),
+  `UnicodeZeroWidthMutator` (`unicode_zero_width`), `TypoglycemiaMutator`
+  (`typoglycemia`), and `ROT13Mutator` / `CaesarCipherMutator` (`rot13`).
+- `BaseStrategy` abstract interface, `ExecutionContext`, and
+  `SingleTurnResult` (`cyberjection/attacks/base.py`), including a shared
+  `_apply_mutations` pre-hook so every strategy runs its configured
+  mutator pipeline the same way before dispatch.
+- Three single-turn attack strategies built on the Phase 1 target gateway:
+  `DirectPromptInjectionStrategy` (override framing),
+  `JailbreakStrategy` (persona/roleplay framing: Developer Mode, DAN-style,
+  sandboxed VM simulation), and `SystemPromptExtractionStrategy`
+  (system-prompt / context-window leak probes).
+- Unit test suite covering every mutator's transformation logic, the
+  registry's registration/collision/lookup behavior, pipeline chaining and
+  ordering, and each attack strategy executed against a mocked
+  `LiteLLMTarget`.
+
+### Fixed
+
+- The zero-width-space and typoglycemia mutators originally drew from the
+  shared global `random` module. Phase 2's stated objective requires
+  "deterministic string transformers," but unseeded global-random calls
+  make generated payloads impossible to reproduce or replay for
+  evaluation, and mutate shared process-wide random state as a side
+  effect. Fixed by giving every randomized mutator an optional `seed`
+  parameter backed by a private `random.Random` instance: the same seed
+  now reproduces byte-identical output, and seeding one mutator never
+  perturbs another's random sequence.
+
+### Known limitations
+
+- `StrategyConfig.converters` (Phase 1 schema) is not yet wired to
+  automatically build a `MutatorPipeline` at campaign-load time; callers
+  currently construct a pipeline explicitly via
+  `cyberjection.mutators.build_pipeline` and pass it to a strategy.
+  Automatic wiring lands with the orchestrator in a later phase.
+- Chaining `base64` with a character-level mutator that runs *after* it
+  (homoglyph, zero-width, typoglycemia) corrupts the Base64 encoding by
+  design -- these mutators operate on raw characters with no awareness of
+  an upstream encoding step. See `docs/ARCHITECTURE.md#mutator-chaining-and-ordering`.
+- The cascade evaluator, persistence, the CLI, the REST API, the
+  dashboard, and reporting are not implemented yet; they ship in
+  Phases 3-10 (see `docs/ARCHITECTURE.md`).
+
 ## [0.1.0] - Phase 1: Core Async Architecture, Declarative Configuration & Target Abstraction Gateway
 
 ### Added
