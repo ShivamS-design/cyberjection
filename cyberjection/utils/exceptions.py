@@ -64,3 +64,23 @@ class UnknownTargetError(CyberjectionException):
     CLI boundary and reported with a clear list of known ids rather than
     letting a `StopIteration`/`KeyError` from a naive lookup surface as a
     traceback for what is, from the operator's side, a typo."""
+
+
+class RateLimitCapacityExceededError(CyberjectionException):
+    """Raised by `DistributedRateLimiter.acquire` when a single request asks
+    for more units than the bucket's configured capacity can ever hold.
+
+    A token bucket's level is capped at its max capacity, so a request for
+    more than that maximum can never succeed no matter how long the caller
+    waits. Without this guard, `acquire` would loop forever sleeping on a
+    request that was misconfigured (e.g. a per-call token estimate larger
+    than the provider's configured `max_tpm`) instead of surfacing the
+    misconfiguration immediately.
+    """
+
+
+class DeadLetterQueueError(CyberjectionException):
+    """Raised when a distributed task exhausts its retry budget and is
+    routed to the dead-letter queue. Carries the original failure so the
+    caller can distinguish "gave up after retries" from a first-attempt
+    failure that hasn't even started retrying yet."""
