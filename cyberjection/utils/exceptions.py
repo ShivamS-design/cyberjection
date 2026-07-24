@@ -42,3 +42,17 @@ class ProviderRateLimitError(ProviderError):
 
 class BudgetExceededError(CyberjectionException):
     """Raised when a campaign's cumulative spend exceeds --max-cost."""
+
+
+class AttackerGenerationError(CyberjectionException):
+    """Raised when the Phase 5 attacker agent can't produce a next payload.
+
+    Unlike `LLMJudgeEvaluator` (which has a legitimate "I don't know" value
+    -- `Verdict.UNCERTAIN` -- to fall back to after exhausting retries), the
+    attacker agent's job is to produce the literal next prompt to send to
+    the target under test. There's no safe placeholder value for that: a
+    fabricated or empty prompt would still consume a real turn and real
+    cost against the target for no signal. So a multi-turn engine that
+    can't get a next payload from the attacker raises loudly and stops that
+    attack trajectory, rather than silently sending garbage.
+    """
