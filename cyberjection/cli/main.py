@@ -1,6 +1,10 @@
 """Command Line Interface Engine (Phase 6): `run`, `inspect`, and `export`
 entrypoints for executing evaluation runs, browsing persisted scan
 history, and re-exporting a prior run's JSON report into another format.
+Phase 8 adds `audit` (dependency/secret/target-URL auditing plus the
+compliance control report) and wires every command through the
+hash-chained audit log and the output-path/target-URL hardening checks
+from `cyberjection.security`.
 
 Built on `typer` (declarative commands) and `rich` (table/console
 rendering) per Task 6.1 of the Phase 6 design spec; both were already
@@ -12,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -30,7 +35,20 @@ from cyberjection.reporting import (
     evaluate_quality_gate,
     resolve_threshold,
 )
-from cyberjection.utils.exceptions import ConfigValidationError, UnknownTargetError
+from cyberjection.security.audit_log import AuditLogger
+from cyberjection.security.compliance import compliance_summary, generate_compliance_report
+from cyberjection.security.dependency_audit import evaluate_dependency_gate, run_dependency_audit
+from cyberjection.security.input_validation import assert_safe_output_path, assert_safe_target_url
+from cyberjection.security.secrets_audit import (
+    scan_campaign_config_for_hardcoded_secrets,
+    scan_paths_for_secrets,
+)
+from cyberjection.utils.exceptions import (
+    ConfigValidationError,
+    PathTraversalError,
+    UnknownTargetError,
+    UnsafeTargetURLError,
+)
 
 app = typer.Typer(
     name="cyberjection",
@@ -38,6 +56,12 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+# Overridable so a deployment can point audit logs at a durable/shared
+# location; defaults alongside the SQLite results DB's own default
+# directory, matching the `.cyberjection/` convention `DatabaseManager`
+# already established.
+_audit_logger = AuditLogger(os.environ.get("CYBERJECTION_AUDIT_LOG", ".cyberjection/audit.jsonl"))
 
 # Exit codes, documented once here rather than as magic numbers scattered
 # through each command: 0 success, 1 a quality-gate failure (the run
@@ -50,6 +74,24 @@ EXIT_OK = 0
 EXIT_QUALITY_GATE_FAILED = 1
 EXIT_USAGE_ERROR = 2
 EXIT_ENVIRONMENT_ERROR = 3
+
+
+def _safe_output_path(path: Path) -> Path:
+    """Wraps `assert_safe_output_path` for CLI report-writing flags,
+    converting `PathTraversalError` into the same usage-error exit path
+    every other bad-input case in this CLI uses, rather than letting it
+    surface as an unhandled traceback. Report paths are contained to the
+    current working directory by default -- matching how this project's
+    own CI workflow already writes `results.sarif`/`results.json`
+    relative to the repo root, so this is a no-op for every existing
+    documented usage."""
+
+    try:
+        return assert_safe_output_path(path, base_dir=Path.cwd())
+    except PathTraversalError as exc:
+        console.print(f"[bold red]Unsafe report path:[/bold red] {exc}")
+        _audit_logger.log("cli.output_path_rejected", resource=str(path), outcome="denied")
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
 
 
 def _resolve_target(config: CampaignConfig, target_id: str) -> TargetConfig:
@@ -128,16 +170,20 @@ def run_evaluation(
 ) -> None:
     """Execute automated security evaluations against a specified target model."""
 
+    _audit_logger.log("cli.run.invoked", resource=str(config_path), metadata={"target": target_id})
+
     try:
         config = load_config(config_path)
     except ConfigValidationError as exc:
         console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        _audit_logger.log("cli.run.config_error", resource=str(config_path), outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
     try:
         target = _resolve_target(config, target_id)
     except UnknownTargetError as exc:
         console.print(f"[bold red]Target error:[/bold red] {exc}")
+        _audit_logger.log("cli.run.unknown_target", resource=target_id, outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
     console.print(
@@ -145,21 +191,35 @@ def run_evaluation(
         f"[yellow]{target.id}[/yellow]"
     )
 
+    # Report output paths are validated up front, before any evaluation
+    # work runs, so a rejected path fails fast rather than after spending
+    # real target/judge calls on a run whose report can't be written.
+    safe_sarif_out = _safe_output_path(sarif_out) if sarif_out else None
+    safe_json_out = _safe_output_path(json_out) if json_out else None
+    safe_markdown_out = _safe_output_path(markdown_out) if markdown_out else None
+
     effective_threshold = resolve_threshold(threshold, config.quality_gate.threshold)
     findings = asyncio.run(_execute_pipeline(config, target))
     gate = evaluate_quality_gate(findings, effective_threshold)
 
     console.print(_render_summary_table(findings, gate))
 
-    if sarif_out:
-        SARIFReporter.export(findings, sarif_out, threshold=effective_threshold)
-        console.print(f"[bold green]SARIF report written to:[/bold green] {sarif_out}")
-    if json_out:
-        JSONExporter.export(findings, json_out, threshold=effective_threshold)
-        console.print(f"[bold green]JSON report written to:[/bold green] {json_out}")
-    if markdown_out:
-        MarkdownExporter.export(findings, markdown_out, threshold=effective_threshold)
-        console.print(f"[bold green]Markdown report written to:[/bold green] {markdown_out}")
+    if safe_sarif_out:
+        SARIFReporter.export(findings, safe_sarif_out, threshold=effective_threshold)
+        console.print(f"[bold green]SARIF report written to:[/bold green] {safe_sarif_out}")
+    if safe_json_out:
+        JSONExporter.export(findings, safe_json_out, threshold=effective_threshold)
+        console.print(f"[bold green]JSON report written to:[/bold green] {safe_json_out}")
+    if safe_markdown_out:
+        MarkdownExporter.export(findings, safe_markdown_out, threshold=effective_threshold)
+        console.print(f"[bold green]Markdown report written to:[/bold green] {safe_markdown_out}")
+
+    _audit_logger.log(
+        "cli.run.quality_gate",
+        resource=target.id,
+        outcome="pass" if gate.passed else "fail",
+        metadata={"max_score": gate.max_score, "threshold": gate.threshold},
+    )
 
     if not gate.passed:
         console.print(
@@ -200,11 +260,14 @@ def inspect_history(
 
     from cyberjection.persistence import _SQLALCHEMY_AVAILABLE
 
+    _audit_logger.log("cli.inspect.invoked", resource=db_url or "<default>", metadata={"limit": limit})
+
     if not _SQLALCHEMY_AVAILABLE:
         console.print(
             "[bold red]Persistence layer unavailable:[/bold red] SQLAlchemy/aiosqlite "
             "are not installed, so there is no scan history to inspect."
         )
+        _audit_logger.log("cli.inspect.unavailable", outcome="failure")
         raise typer.Exit(code=EXIT_ENVIRONMENT_ERROR)
 
     rows = asyncio.run(_inspect_async(db_url, limit))
@@ -220,6 +283,7 @@ def inspect_history(
     console.print(table)
     if not rows:
         console.print("[dim]No campaigns found.[/dim]")
+    _audit_logger.log("cli.inspect.completed", outcome="success", metadata={"rows": len(rows)})
     raise typer.Exit(code=EXIT_OK)
 
 
@@ -240,25 +304,201 @@ def export_report(
 ) -> None:
     """Re-export a previously generated JSON report into SARIF or Markdown."""
 
+    _audit_logger.log("cli.export.invoked", resource=str(from_json), metadata={"format": output_format})
+
     if not from_json.exists():
         console.print(f"[bold red]Input file not found:[/bold red] {from_json}")
+        _audit_logger.log("cli.export.input_missing", resource=str(from_json), outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
+
+    safe_output_path = _safe_output_path(output_path)
 
     payload = json.loads(from_json.read_text(encoding="utf-8"))
     findings = [Finding.model_validate(item) for item in payload.get("findings", [])]
 
     if output_format == "sarif":
-        SARIFReporter.export(findings, output_path, threshold=threshold)
+        SARIFReporter.export(findings, safe_output_path, threshold=threshold)
     elif output_format == "markdown":
-        MarkdownExporter.export(findings, output_path, threshold=threshold)
+        MarkdownExporter.export(findings, safe_output_path, threshold=threshold)
     else:
         console.print(
             f"[bold red]Unsupported format:[/bold red] '{output_format}' "
             "(expected 'sarif' or 'markdown')"
         )
+        _audit_logger.log("cli.export.unsupported_format", resource=output_format, outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
-    console.print(f"[bold green]{output_format.upper()} report written to:[/bold green] {output_path}")
+    console.print(f"[bold green]{output_format.upper()} report written to:[/bold green] {safe_output_path}")
+    _audit_logger.log("cli.export.completed", resource=str(safe_output_path), outcome="success")
+    raise typer.Exit(code=EXIT_OK)
+
+
+@app.command("audit")
+def run_audit(
+    config_path: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="Campaign config file to check for hardcoded secrets/unsafe target URLs"
+    ),
+    check_deps: bool = typer.Option(
+        False, "--deps", help="Run a dependency vulnerability audit via pip-audit"
+    ),
+    check_secrets: bool = typer.Option(
+        False, "--secrets", help="Scan --path location(s) (and --config, if given) for hardcoded credentials"
+    ),
+    check_targets: bool = typer.Option(
+        False, "--targets", help="Check --config's targets for unsafe/private-network URLs (informational only)"
+    ),
+    scan_paths: Optional[List[Path]] = typer.Option(
+        None, "--path", help="Path to scan for secrets; repeatable. Defaults to the current directory."
+    ),
+    show_compliance: bool = typer.Option(
+        False, "--compliance", help="Print the OWASP ASVS / SOC 2 control self-assessment summary"
+    ),
+    report_out: Optional[Path] = typer.Option(
+        None, "--report", help="Write a combined Markdown audit report to this path"
+    ),
+    fail_on_unavailable: bool = typer.Option(
+        False,
+        "--fail-on-unavailable",
+        help="Fail the dependency gate if pip-audit isn't installed (recommended for CI)",
+    ),
+) -> None:
+    """Run security-hardening checks: dependency vulnerabilities, hardcoded
+    secrets, target URL safety, and/or the compliance control summary.
+
+    With no check flags given at all, runs `--deps` and `--secrets` (over
+    the current directory) as a sane default local audit -- a bare
+    `cyberjection audit` does something useful rather than nothing. The
+    `--targets` check is informational only: it never fails the overall
+    gate, since private/localhost target URLs are a normal and expected
+    configuration for local model servers (Ollama, vLLM, etc.), not a
+    finding in themselves -- see `docs/COMPLIANCE.md`'s ASVS-V9.1 note.
+    """
+
+    _audit_logger.log(
+        "cli.audit.invoked",
+        metadata={
+            "deps": check_deps,
+            "secrets": check_secrets,
+            "targets": check_targets,
+            "compliance": show_compliance,
+        },
+    )
+
+    if not any([check_deps, check_secrets, check_targets, show_compliance]):
+        check_deps = True
+        check_secrets = True
+
+    report_sections: List[str] = []
+    overall_ok = True
+
+    if check_deps:
+        console.print("[bold blue]Running dependency vulnerability audit...[/bold blue]")
+        dep_report = run_dependency_audit()
+        gate_passed = evaluate_dependency_gate(dep_report, fail_on_unavailable=fail_on_unavailable)
+        overall_ok = overall_ok and gate_passed
+        if dep_report.source == "unavailable":
+            console.print(f"[yellow]Dependency audit unavailable:[/yellow] {dep_report.detail}")
+        elif dep_report.findings:
+            console.print(f"[bold red]{len(dep_report.findings)} vulnerable dependencies found:[/bold red]")
+            for finding in dep_report.findings:
+                console.print(
+                    f"  - {finding.package} {finding.installed_version}: "
+                    f"{finding.advisory_id} ({finding.summary})"
+                )
+        else:
+            console.print(
+                f"[bold green]No known vulnerabilities found[/bold green] "
+                f"({dep_report.packages_checked} packages checked via {dep_report.source})."
+            )
+        _audit_logger.log(
+            "cli.audit.deps",
+            outcome="pass" if gate_passed else "fail",
+            metadata={"source": dep_report.source, "findings": len(dep_report.findings)},
+        )
+        report_sections.append(
+            f"## Dependency Audit\n\nSource: `{dep_report.source}`  \n"
+            f"Packages checked: {dep_report.packages_checked}  \nFindings: {len(dep_report.findings)}\n"
+        )
+
+    if check_secrets:
+        targets = scan_paths or [Path(".")]
+        console.print(
+            f"[bold blue]Scanning for hardcoded secrets in:[/bold blue] "
+            f"{', '.join(str(p) for p in targets)}"
+        )
+        findings = scan_paths_for_secrets(targets)
+        if config_path and config_path.exists():
+            findings += scan_campaign_config_for_hardcoded_secrets(
+                config_path.read_text(encoding="utf-8"), source_label=str(config_path)
+            )
+        overall_ok = overall_ok and not findings
+        if findings:
+            console.print(f"[bold red]{len(findings)} potential secret(s) found:[/bold red]")
+            for finding in findings:
+                console.print(
+                    f"  - {finding.source}:{finding.line} [{finding.severity}] "
+                    f"{finding.pattern_name} -> {finding.excerpt}"
+                )
+        else:
+            console.print("[bold green]No hardcoded secrets found.[/bold green]")
+        _audit_logger.log(
+            "cli.audit.secrets", outcome="pass" if not findings else "fail", metadata={"findings": len(findings)}
+        )
+        report_sections.append(
+            f"## Secrets Scan\n\nPaths scanned: {', '.join(str(p) for p in targets)}  \n"
+            f"Findings: {len(findings)}\n"
+        )
+
+    if check_targets:
+        if not config_path:
+            console.print("[bold red]--targets requires --config[/bold red]")
+            raise typer.Exit(code=EXIT_USAGE_ERROR)
+        try:
+            target_config = load_config(config_path)
+        except ConfigValidationError as exc:
+            console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+            raise typer.Exit(code=EXIT_USAGE_ERROR)
+        console.print("[bold blue]Checking target URLs...[/bold blue]")
+        flagged: List[str] = []
+        for target in target_config.targets:
+            api_base = target.api_base
+            if not api_base:
+                continue
+            try:
+                assert_safe_target_url(api_base)
+            except UnsafeTargetURLError as exc:
+                flagged.append(f"{target.id}: {exc}")
+        if flagged:
+            console.print(
+                f"[yellow]{len(flagged)} target(s) flagged (informational -- private/local "
+                f"network targets are a normal dev configuration):[/yellow]"
+            )
+            for line in flagged:
+                console.print(f"  - {line}")
+        else:
+            console.print("[bold green]No flagged target URLs.[/bold green]")
+        _audit_logger.log(
+            "cli.audit.targets", outcome="flagged" if flagged else "pass", metadata={"flagged": len(flagged)}
+        )
+        report_sections.append(f"## Target URL Check (informational)\n\nFlagged: {len(flagged)}\n")
+
+    if show_compliance:
+        summary = compliance_summary()
+        console.print(f"[bold blue]Compliance control summary:[/bold blue] {summary}")
+        report_sections.append(generate_compliance_report())
+
+    if report_out:
+        safe_report_out = _safe_output_path(report_out)
+        safe_report_out.parent.mkdir(parents=True, exist_ok=True)
+        safe_report_out.write_text(
+            "# Cyberjection Security Audit Report\n\n" + "\n".join(report_sections), encoding="utf-8"
+        )
+        console.print(f"[bold green]Audit report written to:[/bold green] {safe_report_out}")
+
+    _audit_logger.log("cli.audit.completed", outcome="pass" if overall_ok else "fail")
+
+    if not overall_ok:
+        raise typer.Exit(code=EXIT_QUALITY_GATE_FAILED)
     raise typer.Exit(code=EXIT_OK)
 
 
