@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cyberjection"
-version = "0.2.0"
+version = "0.3.0"
 description = "Enterprise-grade asynchronous LLM red-teaming and security orchestration framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,6 +33,9 @@ dev = [
     "pytest-cov>=5.0",
     "mypy>=1.10",
     "types-PyYAML",
+]
+onnx = [
+    "onnxruntime>=1.17",
 ]
 
 [project.scripts]

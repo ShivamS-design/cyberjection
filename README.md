@@ -15,9 +15,10 @@ Full documentation lives in [`docs/`](docs/):
 
 ## Status
 
-Phases 1-2 of the project roadmap are implemented: **Core Async
-Architecture, Declarative Configuration & Target Abstraction Gateway**, and
-**Mutation Engine & Single-Turn Attack Generators**. See
+Phases 1-3 of the project roadmap are implemented: **Core Async
+Architecture, Declarative Configuration & Target Abstraction Gateway**,
+**Mutation Engine & Single-Turn Attack Generators**, and **3-Tier Cascade
+Evaluation Pipeline**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
 plan and what ships in each stage.
 
@@ -56,6 +57,22 @@ plan and what ships in each stage.
   direct prompt injection (override framing), jailbreak/roleplay framing
   (Developer Mode, DAN-style, VM simulation), and system prompt extraction
   probes -- each returning a normalized `SingleTurnResult`.
+
+### Phase 3: 3-tier cascade evaluation pipeline
+
+- Tier 1: zero-cost deterministic evaluator combining a pure-Python
+  Aho-Corasick automaton (refusal-phrase substrings) with compiled regexes
+  (AWS keys, JWTs, private key headers, DB connection strings, canary
+  tokens) -- sub-millisecond for typical response sizes, no network call.
+- Tier 2: local safety classifier wrapping a quantized Llama Guard 3 ONNX
+  model when available, with a deterministic mock fallback so the tier and
+  its escalation path are testable without a model file.
+- Tier 3: structured-JSON LLM-as-a-judge with a customizable grading
+  rubric and retry/backoff on transient failures.
+- `CascadeEvaluator` chains all three, escalating only when a tier reports
+  `UNCERTAIN` -- so the expensive Tier 3 call is reached only for responses
+  the cheaper tiers genuinely couldn't resolve, and a single instance is
+  safe to share across concurrent evaluations.
 
 ## Installation
 
@@ -113,6 +130,20 @@ async def main():
 asyncio.run(main())
 ```
 
+Evaluate a target's response through the cascade:
+
+```python
+import asyncio
+from cyberjection.evaluators import CascadeEvaluator
+
+async def main():
+    cascade = CascadeEvaluator()  # Tier 1 -> Tier 2 -> Tier 3, escalating on UNCERTAIN
+    outcome = await cascade.evaluate(result.original_prompt, result.target_response)
+    print(outcome.verdict, outcome.confidence, outcome.reason)
+
+asyncio.run(main())
+```
+
 ## Project layout
 
 ```
@@ -123,6 +154,8 @@ cyberjection/
 │   ├── mutators/      # base.py, registry.py, base64_mutator.py, unicode_mutator.py,
 │   │                   # typoglycemia.py, rot13.py
 │   ├── attacks/        # base.py, prompt_injection.py, jailbreak.py, system_extraction.py
+│   ├── evaluators/      # base.py, ahocorasick.py, regex.py, llamaguard.py, llmjudge.py,
+│   │                     # cascade.py, regexes/*.txt
 │   └── utils/         # exceptions.py, context.py
 ├── examples/
 │   └── quickstart.yaml
@@ -137,7 +170,7 @@ cyberjection/
 
 ```bash
 pytest tests/unit/ -v
-mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/
+mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/
 pytest tests/unit/ --cov=cyberjection --cov-report=term-missing
 ```
 

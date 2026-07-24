@@ -2,6 +2,85 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - Phase 3: 3-Tier Cascade Evaluation Pipeline
+
+### Added
+
+- `Verdict` enum (`PASS`/`FAIL`/`UNCERTAIN`), `EvaluationOutcome`, and the
+  `BaseEvaluator` abstract interface (`cyberjection/evaluators/base.py`)
+  shared by every evaluation tier.
+- A pure-Python Aho-Corasick automaton
+  (`cyberjection/evaluators/ahocorasick.py`) for multi-pattern substring
+  matching: refusal-phrase detection costs one linear pass over the
+  response regardless of how many phrases are registered, instead of one
+  pass per phrase.
+- `RegexEvaluator` (Tier 1, `cyberjection/evaluators/regex.py`):
+  Aho-Corasick-matched refusal phrases plus compiled regexes for
+  secrets/canaries (AWS access keys, JWTs, private key headers, Postgres/
+  MongoDB connection strings, Slack tokens, system canary tokens). Curated
+  pattern lists live in `cyberjection/evaluators/regexes/`, with built-in
+  fallback defaults if the pattern files aren't present in a given install.
+- `LocalONNXGuardEvaluator` (Tier 2, `cyberjection/evaluators/llamaguard.py`):
+  local safety classifier. Loads a real `onnxruntime.InferenceSession` when
+  a model path is given and the package is installed; otherwise falls back
+  to a deterministic mock classifier (injectable via `classifier_fn`) so
+  Tier 2's short-circuit and escalation paths are both testable without a
+  model file.
+- `LLMJudgeEvaluator` (Tier 3, `cyberjection/evaluators/llmjudge.py`):
+  structured-JSON LLM-as-a-judge via `litellm.acompletion`, parsed into
+  `StructuredJudgeResponse`. Supports a customizable grading rubric and
+  retries transient failures (malformed JSON, empty responses, transport
+  errors) with exponential backoff before falling back to `UNCERTAIN`.
+- `CascadeEvaluator` (`cyberjection/evaluators/cascade.py`): chains
+  Tier 1 -> Tier 2 -> Tier 3, short-circuiting on the first non-`UNCERTAIN`
+  verdict. `tiers_invoked_for(outcome)` derives which tiers ran from the
+  returned outcome, for cost/telemetry reporting.
+- Unit test suite covering the Aho-Corasick automaton (a textbook
+  overlapping-match case plus a 200-trial brute-force cross-check against
+  naive substring search), all three tiers, and cascade escalation
+  including zero-external-call verification on Tier 1 matches and
+  correctness under concurrent `evaluate()` calls on a shared
+  `CascadeEvaluator` instance.
+
+### Fixed
+
+- An early draft of `CascadeEvaluator` tracked which tiers ran on the most
+  recent call as a `self.last_tiers_invoked` instance attribute, written
+  during `evaluate()`. `CascadeEvaluator` is meant to be shared and called
+  concurrently (one instance per campaign, many in-flight evaluations), and
+  that attribute is exactly the kind of state that gets silently clobbered
+  by a second concurrent call before the first caller reads it. Caught via
+  a concurrency stress test before it shipped. Fixed by removing the
+  mutable attribute entirely -- `tiers_invoked_for(outcome)` derives the
+  same information from `judge_tier_used` alone, which is race-free by
+  construction since it's part of the value already returned to the
+  correct caller.
+- `RegexEvaluator`'s optional `pattern_dir` override was implemented via
+  `global _REGEXES_DIR` inside `__init__`, which would have made one
+  instance's custom pattern directory leak into every `RegexEvaluator`
+  constructed afterward (including default-constructed ones in unrelated
+  code). Fixed before it shipped by threading `pattern_dir` through as a
+  local argument instead of mutating module state.
+
+### Known limitations
+
+- Tier 1's sub-millisecond target holds for typical chat-turn-sized
+  responses (measured well under 1ms up to ~2KB); cost scales linearly
+  with response length for longer text. No included pattern uses a
+  catastrophic-backtracking-prone construct (verified by adversarial-input
+  timing tests), so this is a throughput characteristic, not a correctness
+  or denial-of-service concern.
+- `LocalONNXGuardEvaluator`'s real ONNX inference path
+  (`_onnx_classify`) is an integration stub: the exact tokenization and
+  output-logit layout depend on the specific quantized Llama Guard 3 export
+  in use, so it raises `NotImplementedError` and directs callers to supply
+  `classifier_fn` until a specific model export is wired up.
+- `AssertionConfig` (Phase 1 schema: `judge_model`, `rubric`,
+  `confidence_threshold`) is not yet wired to automatically construct a
+  `CascadeEvaluator` from campaign YAML; that wiring is orchestrator work
+  reserved for a later phase. `CascadeEvaluator` and its tiers are
+  constructed directly in Python for now.
+
 ## [0.2.0] - Phase 2: Mutation Engine & Single-Turn Attack Generators
 
 ### Added
