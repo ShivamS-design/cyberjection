@@ -31,6 +31,22 @@ from cyberjection.cli.main import (  # noqa: E402
 
 runner = CliRunner()
 
+
+@pytest.fixture(autouse=True)
+def _isolated_audit_log(monkeypatch, tmp_path):
+    # Phase 8 wired every command through the module-level `_audit_logger`
+    # singleton, which defaults to `.cyberjection/audit.jsonl` relative to
+    # the current working directory. Without this fixture, every CLI test
+    # in this file would write real audit entries into whatever directory
+    # `pytest` happens to be invoked from (e.g. the repo root), silently
+    # polluting it and leaking state between test runs. Redirecting it to
+    # a fresh per-test tmp_path keeps these tests hermetic.
+    import cyberjection.cli.main as cli_main
+    from cyberjection.security.audit_log import AuditLogger
+
+    monkeypatch.setattr(cli_main, "_audit_logger", AuditLogger(tmp_path / "audit.jsonl"))
+
+
 VALID_CONFIG = """
 name: "CLI Test Campaign"
 targets:
@@ -57,6 +73,7 @@ class TestHelp:
         assert "run" in result.output
         assert "inspect" in result.output
         assert "export" in result.output
+        assert "audit" in result.output
 
     def test_run_help_lists_documented_flags(self) -> None:
         result = runner.invoke(app, ["run", "--help"])
@@ -181,6 +198,31 @@ class TestRunExportFlags:
         after = set(tmp_path.iterdir())
         assert before == after
 
+    def test_path_traversal_in_sarif_out_is_rejected(self, config_path, monkeypatch, tmp_path) -> None:
+        # _safe_output_path() contains report paths to Path.cwd(); running
+        # the CliRunner invocation with cwd() == tmp_path (via monkeypatch,
+        # since CliRunner doesn't chdir on its own) and asking for a
+        # ../outside.sarif path must be rejected as a usage error rather
+        # than silently written outside tmp_path.
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--config",
+                str(config_path),
+                "--target",
+                "support-agent",
+                "--threshold",
+                "9.9",
+                "--sarif-out",
+                "../escape.sarif",
+            ],
+        )
+        assert result.exit_code == EXIT_USAGE_ERROR
+        assert "Unsafe report path" in result.output
+        assert not (tmp_path.parent / "escape.sarif").exists()
+
 
 @pytest.fixture
 def json_report(tmp_path):
@@ -269,3 +311,99 @@ class TestInspectCommand:
         result = runner.invoke(app, ["inspect"])
         assert result.exit_code == EXIT_OK
         assert "No campaigns found" in result.output
+
+
+class TestAuditCommand:
+    def test_bare_audit_defaults_to_deps_and_secrets(self, monkeypatch, tmp_path) -> None:
+        # With no check flags at all, `audit` should run --deps and
+        # --secrets over the current directory rather than doing nothing.
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["audit"])
+        assert result.exit_code == EXIT_OK
+        assert "dependency vulnerability audit" in result.output.lower()
+        assert "scanning for hardcoded secrets" in result.output.lower()
+
+    def test_deps_only_reports_unavailable_in_this_sandbox(self, monkeypatch, tmp_path) -> None:
+        import shutil
+
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["audit", "--deps"])
+        assert result.exit_code == EXIT_OK
+        assert "unavailable" in result.output.lower()
+
+    def test_deps_fail_on_unavailable_fails_the_gate(self, monkeypatch, tmp_path) -> None:
+        import shutil
+
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["audit", "--deps", "--fail-on-unavailable"])
+        assert result.exit_code == EXIT_QUALITY_GATE_FAILED
+
+    def test_secrets_scan_finds_a_planted_secret(self, monkeypatch, tmp_path) -> None:
+        (tmp_path / "leaked.py").write_text('AWS_KEY = "AKIAQWERTYUIOPASDFGH"\n', encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["audit", "--secrets", "--path", str(tmp_path)])
+        assert result.exit_code == EXIT_QUALITY_GATE_FAILED
+        assert "potential secret" in result.output.lower()
+
+    def test_secrets_scan_clean_directory_passes(self, monkeypatch, tmp_path) -> None:
+        (tmp_path / "clean.py").write_text("print('hello world')\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["audit", "--secrets", "--path", str(tmp_path)])
+        assert result.exit_code == EXIT_OK
+        assert "no hardcoded secrets found" in result.output.lower()
+
+    def test_targets_check_requires_config(self) -> None:
+        result = runner.invoke(app, ["audit", "--targets"])
+        assert result.exit_code == EXIT_USAGE_ERROR
+        assert "--targets requires --config" in result.output
+
+    def test_targets_check_flags_a_private_network_target(self, config_path) -> None:
+        result = runner.invoke(app, ["audit", "--targets", "--config", str(config_path)])
+        # VALID_CONFIG's single target has no api_base at all, so nothing
+        # should be flagged -- this is the "no api_base configured" path,
+        # distinct from an explicitly-private one below.
+        assert result.exit_code == EXIT_OK
+        assert "no flagged target urls" in result.output.lower()
+
+    def test_targets_check_flags_explicit_private_api_base(self, tmp_path) -> None:
+        config_text = """
+name: "Private Target Campaign"
+targets:
+  - id: "local-model"
+    provider: "openai"
+    model: "local"
+    api_key: "test-key-not-a-secret"
+    api_base: "http://169.254.169.254/latest/meta-data/"
+quality_gate:
+  threshold: 5.0
+"""
+        config_path = tmp_path / "private.yaml"
+        config_path.write_text(config_text, encoding="utf-8")
+        result = runner.invoke(app, ["audit", "--targets", "--config", str(config_path)])
+        assert result.exit_code == EXIT_OK  # informational only -- never fails the gate
+        assert "1 target(s) flagged" in result.output
+
+    def test_compliance_flag_prints_summary(self) -> None:
+        result = runner.invoke(app, ["audit", "--compliance"])
+        assert result.exit_code == EXIT_OK
+        assert "IMPLEMENTED" in result.output
+
+    def test_report_flag_writes_combined_markdown_report(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.chdir(tmp_path)
+        report_path = tmp_path / "audit-report.md"
+        result = runner.invoke(
+            app, ["audit", "--compliance", "--report", str(report_path)]
+        )
+        assert result.exit_code == EXIT_OK
+        assert report_path.exists()
+        assert "Cyberjection Security Audit Report" in report_path.read_text(encoding="utf-8")
+
+    def test_report_path_traversal_is_rejected(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(
+            app, ["audit", "--compliance", "--report", "../escape-report.md"]
+        )
+        assert result.exit_code == EXIT_USAGE_ERROR
+        assert not (tmp_path.parent / "escape-report.md").exists()
