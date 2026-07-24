@@ -136,6 +136,26 @@ class LiteLLMTarget(BaseTarget):
         async with self._semaphore:
             return await self._call_with_retry(messages)
 
+    async def generate_conversation(self, messages: list[dict[str, str]]) -> TargetResponse:
+        """Send a full multi-turn message history to the configured target
+        as-is, rather than building a single system+user pair the way
+        :meth:`generate` does.
+
+        Added for Phase 5's stateful multi-turn attack engines
+        (`CrescendoEngine`, `TAPEngine`), which own and grow their own
+        conversation history turn by turn and need to replay the whole
+        thing to the target on every call. Applies the exact same
+        target-scoped rate limiting and retry/backoff as :meth:`generate`,
+        so multi-turn attack traffic is governed by the same
+        `requests_per_second` / `burst` / retry policy as single-turn
+        traffic against the same target -- there is no separate, weaker
+        code path for multi-turn calls.
+        """
+
+        await self._rate_limiter.acquire()
+        async with self._semaphore:
+            return await self._call_with_retry(messages)
+
     async def _call_with_retry(self, messages: list[dict[str, str]]) -> TargetResponse:
         from litellm import acompletion  # imported lazily so Phase 1 tests can mock it cheaply
 
