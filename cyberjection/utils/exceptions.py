@@ -56,3 +56,11 @@ class AttackerGenerationError(CyberjectionException):
     can't get a next payload from the attacker raises loudly and stops that
     attack trajectory, rather than silently sending garbage.
     """
+
+
+class UnknownTargetError(CyberjectionException):
+    """Raised by the Phase 6 CLI when `--target` references a target id
+    that isn't present in the loaded campaign configuration. Caught at the
+    CLI boundary and reported with a clear list of known ids rather than
+    letting a `StopIteration`/`KeyError` from a naive lookup surface as a
+    traceback for what is, from the operator's side, a typo."""
