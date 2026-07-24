@@ -84,3 +84,37 @@ class DeadLetterQueueError(CyberjectionException):
     routed to the dead-letter queue. Carries the original failure so the
     caller can distinguish "gave up after retries" from a first-attempt
     failure that hasn't even started retrying yet."""
+
+
+class PathTraversalError(CyberjectionException):
+    """Raised by `cyberjection.security.input_validation.assert_safe_output_path`
+    when a caller-supplied *relative* output path (e.g. `--sarif-out`)
+    resolves outside the permitted base directory, whether via `..`
+    segments or a symlink planted inside that directory -- so a
+    fat-fingered or templated relative report path can't silently escape
+    the working tree. Explicit absolute paths are the caller's deliberate
+    choice and aren't subject to this check; see that function's
+    docstring for the reasoning."""
+
+
+class UnsafeTargetURLError(CyberjectionException):
+    """Raised by `cyberjection.security.input_validation.assert_safe_target_url`
+    when a target's `api_base` resolves to a network location that looks
+    unintentional for the declared provider (e.g. a `custom_http` target
+    whose URL resolves to a cloud metadata endpoint) and the caller hasn't
+    explicitly opted in via `allow_private_networks=True`."""
+
+
+class PayloadTooLargeError(CyberjectionException):
+    """Raised by `cyberjection.security.input_validation.enforce_payload_size_limit`
+    when a prompt or response payload exceeds the configured byte ceiling,
+    guarding against unbounded memory growth or database bloat from a
+    pathological or adversarial target response."""
+
+
+class DependencyAuditError(CyberjectionException):
+    """Raised by `cyberjection.security.dependency_audit` when the audit
+    itself fails to run (as opposed to running successfully and finding
+    vulnerabilities, which is not an error -- it's the audit doing its
+    job). Distinguishes "the audit tool crashed" from "the audit tool
+    reported bad news"."""
