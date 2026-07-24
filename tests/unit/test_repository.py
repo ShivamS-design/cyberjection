@@ -152,3 +152,29 @@ class TestCampaignWithTestsEagerLoad:
         fetched = await repo.get_campaign_with_tests(campaign.id)
         assert len(fetched.tests) == 1
         assert len(fetched.tests[0].turns) == 1
+
+
+@pytest.mark.asyncio
+class TestListRecentCampaigns:
+    """Phase 6: the `inspect` CLI command's data source."""
+
+    async def test_lists_newest_first(self, repo: CampaignRepository) -> None:
+        first = await repo.create_campaign("older-run")
+        second = await repo.create_campaign("newer-run")
+
+        campaigns = await repo.list_recent_campaigns(limit=10)
+
+        ids = [c.id for c in campaigns]
+        assert ids.index(second.id) < ids.index(first.id)
+
+    async def test_respects_limit(self, repo: CampaignRepository) -> None:
+        for i in range(5):
+            await repo.create_campaign(f"run-{i}")
+
+        campaigns = await repo.list_recent_campaigns(limit=2)
+
+        assert len(campaigns) == 2
+
+    async def test_empty_database_returns_empty_list(self, repo: CampaignRepository) -> None:
+        campaigns = await repo.list_recent_campaigns(limit=10)
+        assert campaigns == []
