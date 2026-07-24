@@ -44,6 +44,28 @@ class RateLimitConfig(BaseModel):
     burst: int = Field(default=20, ge=1)
 
 
+class QualityGateConfig(BaseModel):
+    """CI/CD quality-gate threshold for a campaign (Phase 6).
+
+    The Phase 6 design spec's Task 6.5 sketches this as a flat top-level
+    `cyberjection/config.py` module, which does not exist in this
+    codebase -- configuration is the `cyberjection.config` package
+    (`schema.py` + `loader.py`) established in Phase 1. Declared here
+    instead, as an optional section of `CampaignConfig`, so a threshold
+    can travel with a campaign's version-controlled YAML the same way
+    `RateLimitConfig` and `StrategyConfig` already do; the CLI's
+    `--threshold` flag still overrides it per invocation (see
+    `cyberjection.reporting.quality_gate.resolve_threshold`).
+    """
+
+    threshold: float = Field(
+        default=7.0,
+        ge=0.0,
+        le=10.0,
+        description="Findings scoring at or above this value fail the quality gate.",
+    )
+
+
 class TargetConfig(BaseModel):
     """A single system-under-test endpoint (model, agent, or RAG pipeline)."""
 
@@ -116,6 +138,7 @@ class CampaignConfig(BaseModel):
     tests: List[TestCaseConfig] = Field(default_factory=list)
     max_cost_cap: float = Field(default=10.0, ge=0.0)
     max_workers: int = Field(default=50, ge=1, le=200)
+    quality_gate: QualityGateConfig = Field(default_factory=QualityGateConfig)
 
     @model_validator(mode="after")
     def validate_unique_target_ids(self) -> "CampaignConfig":
