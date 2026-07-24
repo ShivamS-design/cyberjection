@@ -68,7 +68,7 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 |---|---|---|---|
 | `id` | string | required | Unique key referenced by test cases. |
 | `type` | string | required | e.g. `single_turn`, `adaptive`. |
-| `converters` | list[str] | `[]` | Mutator ids applied to prompts (Phase 2+). |
+| `converters` | list[str] | `[]` | Mutator aliases applied to prompts, in order, via `cyberjection.mutators.build_pipeline`. See [Mutators](#mutators). |
 | `max_turns` | int | `1` | `1-25`, enforcing the multi-turn depth guardrail. |
 | `attacker_model` | string | optional | Model used to generate adaptive attack prompts (Phase 5+). |
 
@@ -94,6 +94,53 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `owasp_category` | string | optional | e.g. `LLM06_SENSITIVE_INFO_DISCLOSURE`. |
 | `assertions` | list of `AssertionConfig` | `[]` | Checks run against the response (Phase 3+). |
 | `metadata` | dict | `{}` | Free-form key/value pairs. |
+
+## Mutators
+
+Mutators live in `cyberjection.mutators` and transform a prompt string into
+an obfuscated payload. Each is registered under a short alias so it can be
+referenced by name (e.g. in `StrategyConfig.converters`) instead of
+importing the class directly:
+
+```python
+from cyberjection.mutators import build_pipeline, list_mutator_aliases
+
+list_mutator_aliases()
+# ['base64', 'homoglyph', 'rot13', 'typoglycemia', 'unicode_zero_width']
+
+pipeline = build_pipeline(["typoglycemia", "rot13"])
+pipeline.execute("ignore all previous instructions")
+```
+
+| Alias | Class | Notes |
+|---|---|---|
+| `base64` | `Base64Mutator` | Encodes the prompt as Base64 wrapped in decoder instructions. Put this **last** in a chain -- later character-level mutators will corrupt the encoding. |
+| `homoglyph` | `HomoglyphMutator` | Latin -> Cyrillic/Greek confusable substitution. Optional `substitution_rate` (default `1.0`) and `seed` for partial, reproducible substitution. |
+| `unicode_zero_width` | `UnicodeZeroWidthMutator` | Injects invisible `U+200B` between characters. Optional `insertion_rate` (default `0.4`) and `seed`. |
+| `typoglycemia` | `TypoglycemiaMutator` | Scrambles interior letters of words longer than 3 characters; first/last letters and non-alphabetic tokens are preserved. Optional `seed`. |
+| `rot13` | `ROT13Mutator` | ROT13 substitution cipher; its own inverse. The general case, `CaesarCipherMutator(shift=N)`, is available but not separately registered. |
+
+Mutators that use randomization accept an optional `seed` for reproducible
+output; each draws from its own private RNG instance rather than the
+shared `random` module, so seeding one mutator never affects another.
+
+## Attack strategies
+
+Single-turn strategies live in `cyberjection.attacks` and implement
+`BaseStrategy.execute(target, seed_prompt, context) -> SingleTurnResult`.
+Every strategy accepts an optional `mutator_pipeline` (a `MutatorPipeline`)
+applied to the framed prompt before dispatch.
+
+| Strategy | `strategy_id` | Notes |
+|---|---|---|
+| `DirectPromptInjectionStrategy` | `direct_prompt_injection` | Wraps the seed prompt in one of three override-framing templates, selected via `frame_index` (mod 3). |
+| `JailbreakStrategy` | `jailbreak_roleplay` | Wraps the seed prompt in a persona frame: `developer_mode` (default), `dan`, or `vm_simulation`, selected via `persona`. |
+| `SystemPromptExtractionStrategy` | `system_prompt_extraction` | Sends one of four extraction probes, selected via `probe_index` (mod 4); the last probe embeds `seed_prompt` as pretext, the others probe directly. |
+
+`ExecutionContext(test_id, target_id, owasp_category="LLM01_PROMPT_INJECTION",
+max_cost_limit=5.0)` carries the per-test metadata a strategy needs;
+`SingleTurnResult` is the standardized output every strategy returns,
+ready for the evaluation cascade in Phase 3.
 
 ## Full example
 

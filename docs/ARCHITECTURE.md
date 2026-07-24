@@ -60,9 +60,8 @@ persistence and reporting.
 
 ## Phase 1: Core Async Architecture & Target Abstraction Gateway
 
-This is the current implementation. It covers the bottom two layers of the
-diagram above (target abstraction) plus the configuration layer that feeds
-the orchestrator in later phases.
+Covers the bottom two layers of the diagram above (target abstraction) plus
+the configuration layer that feeds the orchestrator in later phases.
 
 | Module | Responsibility |
 |---|---|
@@ -90,12 +89,59 @@ semaphore is held for the duration of all retries for a given call, which
 intentionally slows further concurrent admission to the same target while
 it's backing off from a rate limit.
 
+## Phase 2: Mutation Engine & Single-Turn Attack Generators
+
+Builds the offensive payload generation core on top of the Phase 1 target
+gateway: a chainable mutation pipeline, a dynamic mutator registry, and the
+first three single-turn attack strategies.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/mutators/base.py` | `BaseMutator` abstract interface and `MutatorPipeline`, the sequencing engine that chains mutators. |
+| `cyberjection/mutators/registry.py` | Dynamic alias registry (`register_mutator`, `get_mutator`, `build_pipeline`) so mutator chains can be declared as plain alias strings. |
+| `cyberjection/mutators/base64_mutator.py` | `Base64Mutator`: encodes the payload as Base64 wrapped in decoder instructions. |
+| `cyberjection/mutators/unicode_mutator.py` | `UnicodeZeroWidthMutator` (invisible `U+200B` injection) and `HomoglyphMutator` (Latin -> Cyrillic/Greek confusable substitution). |
+| `cyberjection/mutators/typoglycemia.py` | `TypoglycemiaMutator`: scrambles interior letters of words > 3 characters, first/last letters fixed. |
+| `cyberjection/mutators/rot13.py` | `CaesarCipherMutator` (general shift cipher) and `ROT13Mutator` (shift 13, its own inverse). |
+| `cyberjection/attacks/base.py` | `BaseStrategy` abstract interface, `ExecutionContext`, `SingleTurnResult`; the shared `_apply_mutations` mutation pre-hook every strategy calls before dispatch. |
+| `cyberjection/attacks/prompt_injection.py` | `DirectPromptInjectionStrategy`: override-framing attacks aimed at forcing canary disclosure or unsafe tool execution. |
+| `cyberjection/attacks/jailbreak.py` | `JailbreakStrategy`: persona/roleplay framing (Developer Mode, DAN-style, sandboxed VM simulation). |
+| `cyberjection/attacks/system_extraction.py` | `SystemPromptExtractionStrategy`: probes engineered to leak a target's hidden system prompt or preceding context window. |
+
+### Mutator chaining and ordering
+
+`MutatorPipeline` applies mutators strictly in list order, each consuming
+the previous mutator's output. Two of the built-in mutators use
+randomization (`UnicodeZeroWidthMutator`, `HomoglyphMutator` at a partial
+`substitution_rate`, and `TypoglycemiaMutator`); each takes an optional
+`seed` and draws from a private `random.Random` instance rather than the
+shared global `random` module, so a given seed reproduces byte-identical
+output and seeding one mutator never perturbs unrelated code's random
+state.
+
+`Base64Mutator` should generally run **last** in a chain: any
+character-level mutator applied after it (homoglyph, zero-width injection,
+typoglycemia) mutates the Base64 alphabet itself and corrupts the encoded
+payload rather than the underlying attack text.
+
+### Attack strategy execution flow
+
+Every `BaseStrategy` subclass follows the same four steps: frame the seed
+prompt with attack-specific template text, run the framed prompt through
+`_apply_mutations` (the strategy's configured `MutatorPipeline`, a no-op if
+none is set), dispatch the mutated payload through `LiteLLMTarget.generate`,
+and normalize the response into a `SingleTurnResult` via the shared
+`_to_result` helper. Because dispatch goes through the same `LiteLLMTarget`
+built in Phase 1, every strategy execution inherits that target's
+token-bucket rate limiting, concurrency cap, and retry/backoff behavior
+with no additional wiring.
+
 ## Roadmap
 
 | Phase | Scope |
 |---|---|
-| 1 (current) | Core async architecture, declarative configuration, target abstraction gateway |
-| 2 | Mutation engine (Base64, Homoglyph, Typoglycemia, Unicode, Pig Latin) & single-turn attack generators (direct injection, jailbreaks, roleplay, DAN) |
+| 1 | Core async architecture, declarative configuration, target abstraction gateway |
+| 2 (current) | Mutation engine (Base64, Homoglyph, Typoglycemia, Unicode zero-width, ROT13/Caesar) & single-turn attack generators (direct injection, jailbreak/roleplay, system prompt extraction) |
 | 3 | Three-tier cascade evaluation pipeline (regex -> local ONNX -> LLM judge) |
 | 4 | Persistence layer, SQLAlchemy database models, campaign resumability |
 | 5 | Stateful multi-turn adaptive attack engine (Crescendo, PAIR, TAP) |
