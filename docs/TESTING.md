@@ -70,6 +70,22 @@ cyberjection-redis -p 6379:6379 redis:alpine`, matching the Phase 7 spec's
 own prerequisite); `test_retry.py`'s pure backoff/payload-builder tests
 need neither Redis nor Celery and always run.
 
+To run only the Phase 8 suite:
+
+```bash
+pytest tests/unit/test_input_validation.py tests/unit/test_audit_log.py tests/unit/test_secrets_audit.py tests/unit/test_dependency_audit.py tests/unit/test_compliance.py -v
+
+# hardening audit smoke check (dependency + secrets scan of the repo itself)
+cyberjection audit
+```
+
+None of the five files above `pytest.importorskip` anything -- every
+`cyberjection.security` module is pure stdlib plus, for
+`dependency_audit.py`, an optional `subprocess` call to `pip-audit` that
+degrades to an honest `source="unavailable"` result rather than skipping
+or failing when the `security` extra isn't installed. `test_dependency_audit.py`
+exercises that real fallback path directly rather than mocking it.
+
 ## Layout
 
 | File | Covers |
@@ -91,7 +107,7 @@ need neither Redis nor Celery and always run.
 | `tests/unit/test_attacker_agent.py` | `AttackerAgent`: structured JSON parsing, goal interpolation, conversation-history forwarding, and retry-then-`AttackerGenerationError` behavior on malformed JSON, empty responses, and missing required fields. |
 | `tests/unit/test_crescendo_engine.py` | `CrescendoEngine.run()`: exactly one `AttackNode` yielded per turn (including the backtrack-turn regression case), state-rollback correctness (a backtracked turn's exchange is absent from what's next sent to the target), `REFUSED` vs `BACKTRACK` status selection based on remaining backtrack budget, success short-circuiting before `max_turns`, and graceful termination on attacker failure. |
 | `tests/unit/test_tap_pruning.py` | `TAPEngine.execute_tree_search()`: pruning below/above the score threshold, multi-depth expansion (the loop-nesting regression case), returning the best partial path when nothing succeeds, and fault tolerance when an individual branch's attacker call fails via `asyncio.gather(return_exceptions=True)`. |
-| `tests/unit/test_cli.py` | The `cyberjection` CLI end-to-end via `typer.testing.CliRunner`: `--help`, required-option enforcement, config/target error handling, quality-gate exit codes (pass/fail/threshold-fallback-to-campaign-config), SARIF/JSON/Markdown export flags, the `export` command's format handling, and `inspect`'s environment-unavailable and rendering paths (the latter via a monkeypatched `_inspect_async`, isolating the test from needing a real database). |
+| `tests/unit/test_cli.py` | The `cyberjection` CLI end-to-end via `typer.testing.CliRunner`: `--help`, required-option enforcement, config/target error handling, quality-gate exit codes (pass/fail/threshold-fallback-to-campaign-config), SARIF/JSON/Markdown export flags (including relative-path-traversal rejection), the `export` command's format handling, `inspect`'s environment-unavailable and rendering paths (the latter via a monkeypatched `_inspect_async`), and (Phase 8) the `audit` command's default-flag behavior, `--deps`/`--fail-on-unavailable`, `--secrets` finding/clean paths, `--targets`' config-required and informational-only behavior, `--compliance`, and `--report` (including its own path-traversal rejection). |
 | `tests/unit/test_sarif_exporter.py` | `SARIFReporter`: structural validation against a locally-authored minimal SARIF 2.1.0 schema, rule-catalog deduplication for a repeated `rule_id`, and threshold-relative severity levels (both regression coverage for bugs in the Phase 6 design spec's own sketch). |
 | `tests/unit/test_exporters.py` | `JSONExporter` (summary block correctness, `Finding` round-trip via `model_validate`) and `MarkdownExporter` (pass/fail header, per-finding table rows, pipe-character escaping). |
 | `tests/unit/test_quality_gate.py` | `resolve_threshold`'s CLI > config > default precedence (including that an explicit `0.0` at either level is not treated as "missing") and `evaluate_quality_gate`'s pass/fail/exactly-at-threshold decision, independent of any CLI or Typer machinery. |
@@ -99,6 +115,11 @@ need neither Redis nor Celery and always run.
 | `tests/unit/test_retry.py` | `compute_backoff_delay`'s exponential growth, jitter injection (with a deterministic injected `rng`), capping, and input validation; `build_dead_letter_payload`'s JSON-serializability and field population. No Redis/Celery dependency. |
 | `tests/unit/test_coordinator.py` | `DistributedClusterCoordinator`: abort broadcast reaching a subscribed listener, a pre-subscription broadcast being a silent no-op, channel isolation between differently-named coordinators on the same Redis instance, pubsub connection cleanup after listening (regression test for a connection leak in the design spec's own sketch), and `broadcast_if_failing`'s `Verdict.FAIL`-only trigger condition. |
 | `tests/unit/test_distributed_tasks.py` | `execute_eval_turn_task`: successful completion, rate-limit enforcement, transient-failure retry-then-succeed, exhausted-retry `MaxRetriesExceededError`, retry count bounded by `MAX_RETRIES`, dead-letter-queue push on exhaustion (and never on success), and per-target rate-limiter instance caching. |
+| `tests/unit/test_input_validation.py` | `assert_safe_output_path` (relative containment, absolute-path pass-through, `..` and symlink escape rejection), `assert_safe_target_url` (scheme/hostname/literal-IP rejection and the `allow_private_networks` opt-in), and `enforce_payload_size_limit` (byte-vs-character sizing, exact-boundary behavior). |
+| `tests/unit/test_audit_log.py` | `AuditLogger`: hash-chain linkage across entries, metadata round-tripping, JSONL well-formedness, and thread-safe concurrent appends (200 entries from 10 threads, verified via `verify_chain`); `verify_chain`: clean-chain validation, tampered-entry detection at the correct index, and empty/missing-file handling. |
+| `tests/unit/test_secrets_audit.py` | `scan_text_for_secrets` against every registered pattern (AWS keys, private key headers, Slack/GitHub tokens, generic API-key assignments) and placeholder-marker suppression; `scan_paths_for_secrets` (recursive walk, excluded-dir skipping, binary-file tolerance); `scan_campaign_config_for_hardcoded_secrets` (literal-vs-`${VAR}`-interpolated `api_key` values). |
+| `tests/unit/test_dependency_audit.py` | `parse_pip_audit_json` against canned `pip-audit --format json` fixtures (single/multiple findings, missing fields, truncation, malformed input); `run_dependency_audit`'s real `source="unavailable"` fallback in this sandbox; `evaluate_dependency_gate`'s pass/fail decision across every `source` value and `fail_on_unavailable` setting. |
+| `tests/unit/test_compliance.py` | Structural invariants of the real `CONTROL_REGISTRY` (unique ids, evidence required for `IMPLEMENTED`, notes required for `NOT_APPLICABLE`) plus `compliance_summary`/`generate_compliance_report` against both the real registry and small synthetic ones (grouping order, missing-evidence/notes rendering, multiline-note flattening). |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions

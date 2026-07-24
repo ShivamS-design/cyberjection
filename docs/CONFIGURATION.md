@@ -342,6 +342,34 @@ docker run -d --name cyberjection-redis -p 6379:6379 redis:alpine
 celery -A cyberjection.distributed.celery_app worker --loglevel=info
 ```
 
+## Security & hardening (Phase 8)
+
+`cyberjection/security/` (Phase 8) is, like the distributed layer, not
+driven by campaign YAML -- it operates on the CLI's own inputs and this
+repository's source tree rather than a target's config.
+
+| Environment variable | Default | Used by |
+|---|---|---|
+| `CYBERJECTION_AUDIT_LOG` | `.cyberjection/audit.jsonl` | `cyberjection/cli/main.py`: where the hash-chained audit log (`AuditLogger`) is written. Override to point at a durable or shared location in a deployment. |
+
+The `audit` CLI command's flags are documented in
+[`docs/SECURITY.md`](SECURITY.md#hardening-controls-shipped-in-phase-8);
+briefly:
+
+```bash
+cyberjection audit                                    # --deps + --secrets over "."
+cyberjection audit --deps --fail-on-unavailable        # CI-safe: fails if pip-audit is missing
+cyberjection audit --secrets --path cyberjection/ --path tests/
+cyberjection audit --targets --config examples/quickstart.yaml
+cyberjection audit --compliance --report audit-report.md
+```
+
+`assert_safe_output_path`/`assert_safe_target_url`/`enforce_payload_size_limit`
+have no environment-variable configuration -- they're called with
+explicit arguments from the CLI (`base_dir=Path.cwd()` for output paths)
+rather than tunable via environment, keeping their behavior predictable
+regardless of the calling environment's variables.
+
 ## Full example
 
 See [`examples/quickstart.yaml`](../examples/quickstart.yaml) for a

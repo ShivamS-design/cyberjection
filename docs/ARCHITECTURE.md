@@ -492,6 +492,85 @@ a campaign should dispatch to the distributed queue instead of running
 locally. See [Cost and orchestration status](#cost-and-orchestration-status)
 and the Known Limitations section of the Phase 7 changelog entry.
 
+## Phase 8: Security Auditing, Compliance & Production Hardening
+
+Hardens the CLI surface itself and gives operators tooling to audit the
+project's own supply chain and configuration, rather than adding a new
+evaluation capability against a target model. Every check here inspects
+*this project's* dependencies, source tree, and CLI inputs -- distinct
+from the Tier 1-3 cascade, which evaluates a *target's* responses.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/security/input_validation.py` | `assert_safe_output_path` (relative-path/symlink containment for `--sarif-out`/`--json-out`/`--markdown-out`/`-o`/`--report`), `assert_safe_target_url` (literal-IP SSRF guard for `TargetConfig.api_base`), `enforce_payload_size_limit`. |
+| `cyberjection/security/audit_log.py` | `AuditLogger`/`verify_chain`: SHA-256 hash-chained, append-only JSONL audit trail for every CLI invocation and outcome. |
+| `cyberjection/security/secrets_audit.py` | `scan_paths_for_secrets` / `scan_campaign_config_for_hardcoded_secrets`: pattern-based scanner for committed credentials (AWS keys, private key headers, Slack/GitHub tokens, generic API-key assignments) in source and campaign YAML. |
+| `cyberjection/security/dependency_audit.py` | `run_dependency_audit`: shells out to the real `pip-audit` CLI (optional `security` extra) against the live PyPA Advisory Database; reports an honest `source="unavailable"` state rather than a fabricated clean result when `pip-audit` isn't installed. |
+| `cyberjection/security/compliance.py` | `CONTROL_REGISTRY`: an OWASP ASVS 4.0 / SOC 2 (2017) control self-assessment mapped to real code and tests; `generate_compliance_report()` renders it as Markdown (`docs/COMPLIANCE.md`). |
+| `cyberjection/cli/main.py` (`audit` command) | Ties the above together: `--deps`, `--secrets`, `--targets` (informational), `--compliance`, `--report`, `--fail-on-unavailable`. Every `run`/`inspect`/`export`/`audit` invocation now also writes an `AuditLogger` entry. |
+
+### Output-path containment: relative escapes only, not absolute destinations
+
+`assert_safe_output_path` only rejects a *relative* path that resolves
+outside its `base_dir` (via a `..` segment or a symlink planted inside an
+otherwise-trusted directory) -- an explicit absolute path is treated as
+the operator's deliberate choice and passed through unchanged. An earlier
+version of this guard rejected *any* path (relative or absolute) outside
+`base_dir`, which is a stricter reading of ASVS-V12.1 but broke the
+ordinary case of writing a report to a CI artifacts mount or `/tmp`
+outside the working tree -- caught by this phase's own CLI test suite
+(`tests/unit/test_cli.py::TestRunExportFlags`) exercising real absolute
+`tmp_path` output locations, not a synthetic path. See
+`assert_safe_output_path`'s docstring for the full reasoning.
+
+### SSRF guard is a literal-value check, not a DNS-resolving one
+
+`assert_safe_target_url` inspects a target's declared scheme and, when
+the hostname is itself a literal IP, whether that address is
+private/loopback/link-local/reserved/multicast. It deliberately does
+**not** resolve DNS hostnames -- doing so would add a network call to
+every config load and still not close the gap, since the resolved
+address can legitimately differ between validation time and connection
+time (DNS rebinding). This is reflected honestly in
+`docs/COMPLIANCE.md`'s ASVS-V9.1 entry as `PARTIAL`, not `IMPLEMENTED`.
+The `audit --targets` check surfaces this only as an informational
+finding: private/localhost target URLs are the normal, correct
+configuration for a local Ollama/vLLM deployment, not a defect.
+
+### Dependency audit reports "unavailable" honestly rather than "clean"
+
+`run_dependency_audit()` shells out to the real `pip-audit` tool when
+it's installed and returns its real findings against the live PyPA
+Advisory Database. This project deliberately ships no hand-maintained,
+offline CVE list as a fallback -- a static list goes stale immediately,
+and a security tool that reports "0 vulnerabilities found" when it
+actually just couldn't run the check is a more dangerous failure mode
+than one that visibly says so. `evaluate_dependency_gate(...,
+fail_on_unavailable=True)` (set by the CI hardening-gate job) turns that
+honest "unavailable" state into a hard CI failure so a broken or missing
+`pip-audit` install can't silently masquerade as a clean bill of health.
+
+### Audit log: tamper-evident, not tamper-proof
+
+Every `AuditEvent` carries a SHA-256 hash of its own canonical payload
+plus the previous entry's hash, forming a hash chain (`GENESIS_HASH` for
+the first entry). `verify_chain()` re-walks the log and recomputes every
+hash, detecting any modification to an *existing* entry. This does not
+prevent an attacker with filesystem write access from truncating the log
+and starting a fresh chain -- there is no append-only filesystem
+enforcement or remote log shipping in this phase -- which is why
+`docs/COMPLIANCE.md` marks ASVS-V7.4 `PARTIAL`, not `IMPLEMENTED`.
+
+### Self-assessment, not certification
+
+`docs/COMPLIANCE.md` maps ASVS/SOC2 controls to real, specific code and
+test evidence, honestly marking a control `NOT_APPLICABLE` or `PARTIAL`
+rather than `IMPLEMENTED` wherever the evidence doesn't support it (e.g.
+authentication and API-security controls are `NOT_APPLICABLE` until
+Phase 10's web dashboard/API introduces those surfaces). It is not, and
+does not claim to be, a substitute for an actual third-party audit or
+SOC 2 report, which only a licensed CPA firm can issue.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -502,8 +581,8 @@ and the Known Limitations section of the Phase 7 changelog entry.
 | 4 | Persistence layer, SQLAlchemy database models, campaign resumability |
 | 5 | Stateful multi-turn adaptive attack engine (Crescendo, TAP) |
 | 6 | CI/CD pipeline integration, CLI harness (Typer + Rich), enterprise reporting (SARIF, JSON, Markdown) |
-| 7 (current) | Distributed worker architecture: Celery + Redis task queues, atomic cluster-wide RPM/TPM rate limiting, Pub/Sub abort coordination, retry/dead-letter fault tolerance |
-| 8 | Security auditing, compliance & production hardening |
+| 7 | Distributed worker architecture: Celery + Redis task queues, atomic cluster-wide RPM/TPM rate limiting, Pub/Sub abort coordination, retry/dead-letter fault tolerance |
+| 8 (current) | Security auditing, compliance & production hardening: output-path/SSRF/payload-size guards, hash-chained audit log, secrets/dependency scanning, ASVS/SOC2 control self-assessment |
 | 9 | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack (and, per Phase 7, optionally the distributed queue) |
 | 10 | Plugin architecture, web dashboard, container deployment |
 
@@ -540,10 +619,14 @@ persistence layer is orchestrator work reserved for a later phase.
 
 | Risk | Mitigation |
 |---|---|
-| Credential exposure via hardcoded API keys or logs | Environment-variable expansion keeps secrets out of YAML files; secret values are wrapped in `SecretStr` and never appear in reprs or logs. |
+| Credential exposure via hardcoded API keys or logs | Environment-variable expansion keeps secrets out of YAML files; secret values are wrapped in `SecretStr` and never appear in reprs or logs; `cyberjection audit --secrets` (Phase 8) scans source and campaign config for accidentally-committed credentials. |
 | Malicious payload execution via custom plugins (Phase 10) | Sandboxed plugin runtimes and strict input validation, planned for the plugin architecture phase. |
-| Unbounded resource exhaustion from runaway multi-turn loops | `max_cost_cap` circuit breaker and `max_turns` bound (<= 25) enforced at the schema level; `TAPEngine.pruning_threshold` bounds branch survival until cost-cap wiring lands. |
-| A misconfigured CI/CD pipeline silently passing a security gate | The CLI's exit-code contract keeps a quality-gate failure (`1`) distinct from a usage/config error (`2`) and an environment error (`3`), so a pipeline can't mistake "the CLI couldn't even run" for "the target passed evaluation." |
+| Unbounded resource exhaustion from runaway multi-turn loops | `max_cost_cap` circuit breaker and `max_turns` bound (<= 25) enforced at the schema level; `TAPEngine.pruning_threshold` bounds branch survival until cost-cap wiring lands; `enforce_payload_size_limit` (Phase 8) bounds individual prompt/response payload size. |
+| A misconfigured CI/CD pipeline silently passing a security gate | The CLI's exit-code contract keeps a quality-gate failure (`1`) distinct from a usage/config error (`2`) and an environment error (`3`), so a pipeline can't mistake "the CLI couldn't even run" for "the target passed evaluation." Phase 8's `hardening-gate` CI job additionally fails the build on a known dependency vulnerability or a hardcoded secret, and `--fail-on-unavailable` prevents a missing `pip-audit` install from silently masquerading as a clean scan. |
+| A report path escaping its intended output directory | `assert_safe_output_path` (Phase 8) rejects a relative `--sarif-out`/`--json-out`/`--markdown-out`/`-o`/`--report` path that resolves outside the current working directory via `..` segments or a planted symlink; explicit absolute paths are the operator's deliberate choice and pass through. |
+| An unintentional SSRF-shaped target URL (cloud metadata endpoint, internal service) | `assert_safe_target_url` (Phase 8) rejects literal private/loopback/link-local/reserved/metadata IP addresses and blocked hostnames by default; `cyberjection audit --targets` surfaces flagged targets as an informational (non-blocking) finding. |
+| Undetected tampering with the CLI's own audit trail | `AuditLogger`'s SHA-256 hash chain (Phase 8) makes silent modification of an existing log entry detectable via `verify_chain()`; this is tamper-*evident*, not tamper-*proof* -- see the Phase 8 section above. |
+| A dependency with a known published vulnerability | `cyberjection audit --deps` (Phase 8) shells out to the real `pip-audit` tool against the live PyPA Advisory Database rather than a static, staleness-prone offline CVE list; reports an honest "unavailable" state (optionally CI-fatal via `--fail-on-unavailable`) when the tool isn't installed rather than a false "clean" result. |
 
 For air-gapped deployments, Tier 1 (regex) and Tier 2 (local ONNX)
 evaluation, plus a local Ollama or vLLM target, allow fully offline
