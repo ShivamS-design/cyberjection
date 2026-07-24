@@ -1,0 +1,51 @@
+# GitLab CI security evaluation gate (Phase 6, Task 6.4), mirroring
+# .github/workflows/cyberjection.yml so the same quality-gate behavior
+# (non-zero exit on threshold breach, SARIF/JSON artifacts) is available to
+# GitLab-hosted forks/mirrors of this repository. Installs via
+# `pip install -e ".[dev]"`, matching this project's actual hatchling-based
+# build (see the note in cyberjection.yml about why this isn't Poetry).
+stages:
+  - test
+  - security
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+
+.install_deps: &install_deps
+  - python -m pip install --upgrade pip
+  - pip install -e ".[dev]"
+
+unit-tests:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - *install_deps
+    - pytest tests/unit/ -v
+
+security-eval:
+  stage: security
+  image: python:3.12-slim
+  needs: ["unit-tests"]
+  script:
+    - *install_deps
+    - >
+      cyberjection run
+      --config examples/quickstart.yaml
+      --target support-agent
+      --threshold 7.0
+      --sarif-out results.sarif
+      --json-out results.json
+  artifacts:
+    when: always
+    reports:
+      sast: results.sarif
+    paths:
+      - results.sarif
+      - results.json
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'

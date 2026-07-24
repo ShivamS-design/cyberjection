@@ -15,11 +15,12 @@ Full documentation lives in [`docs/`](docs/):
 
 ## Status
 
-Phases 1-5 of the project roadmap are implemented: **Core Async
+Phases 1-6 of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
 Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
-Engine**, and **Stateful Multi-Turn Adaptive Attack Engine**. See
+Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, and **CI/CD
+Pipeline Integration, CLI Harness & Enterprise Reporting**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
 plan and what ships in each stage.
 
@@ -113,6 +114,28 @@ plan and what ships in each stage.
   Phase 3 via `score_from_evaluation()`, which bridges Phase 3's
   `Verdict`/confidence result onto the 0-10 attack-progress scale these
   engines are built around.
+
+### Phase 6: CI/CD pipeline integration, CLI harness & enterprise reporting
+
+- `cyberjection` CLI (Typer + Rich): `run` executes an evaluation against a
+  configured target and applies a pass/fail quality gate; `inspect` browses
+  persisted campaign history; `export` re-renders a prior JSON report into
+  SARIF or Markdown.
+- `SARIFReporter`: exports findings as SARIF 2.1.0, ready for GitHub
+  Advanced Security's code scanning tab or GitLab's Security Dashboard --
+  with severity levels derived from the run's actual `--threshold` rather
+  than a fixed cutoff, and one deduplicated catalog entry per rule id.
+- `JSONExporter` / `MarkdownExporter`: machine-readable JSON audit logs and
+  executive Markdown summaries, both carrying the same pass/fail summary
+  block as the SARIF report.
+- `evaluate_quality_gate()`: a pure threshold decision (findings scoring at
+  or above the threshold fail the gate) decoupled from the CLI, with a
+  documented exit-code convention (`0` pass, `1` gate failure, `2` usage
+  error, `3` environment error) so CI pipelines can branch on it reliably.
+- Reusable GitHub Actions workflow (`.github/workflows/cyberjection.yml`)
+  and GitLab CI template (`.gitlab-ci.yml`) running the CLI as a
+  pull-request security gate and uploading the SARIF report as a build
+  artifact.
 
 ## Installation
 
@@ -235,25 +258,46 @@ async def main():
 asyncio.run(main())
 ```
 
+Run an evaluation from the command line and gate a CI/CD pipeline on it:
+
+```bash
+cyberjection run \
+  --config examples/quickstart.yaml \
+  --target support-agent \
+  --threshold 7.0 \
+  --sarif-out results.sarif \
+  --json-out results.json
+# exits 0 (pass), 1 (quality gate failed), 2 (usage/config error),
+# or 3 (a command's runtime dependency isn't installed)
+
+cyberjection inspect --limit 5     # browse recent persisted campaigns
+cyberjection export --from-json results.json --output results.md --format markdown
+```
+
 ## Project layout
 
 ```
 cyberjection/
 ├── cyberjection/
-│   ├── config/         # schema.py, loader.py
-│   ├── providers/      # base.py, litellm_provider.py
-│   ├── mutators/       # base.py, registry.py, base64_mutator.py, unicode_mutator.py,
-│   │                   # typoglycemia.py, rot13.py
-│   ├── attacks/        # base.py, prompt_injection.py, jailbreak.py, system_extraction.py,
-│   │                   # state.py, attacker.py, crescendo.py, tap.py
-│   ├── evaluators/     # base.py, ahocorasick.py, regex.py, llamaguard.py, llmjudge.py,
-│   │                   # cascade.py, regexes/*.txt
-│   ├── persistence/    # models.py, sqlite.py, repository.py, resumability.py
-│   └── utils/          # exceptions.py, context.py
+│   ├── cli/             # main.py (Typer app: run, inspect, export)
+│   ├── config/          # schema.py, loader.py
+│   ├── providers/       # base.py, litellm_provider.py
+│   ├── mutators/        # base.py, registry.py, base64_mutator.py, unicode_mutator.py,
+│   │                    # typoglycemia.py, rot13.py
+│   ├── attacks/         # base.py, prompt_injection.py, jailbreak.py, system_extraction.py,
+│   │                    # state.py, attacker.py, crescendo.py, tap.py
+│   ├── evaluators/      # base.py, ahocorasick.py, regex.py, llamaguard.py, llmjudge.py,
+│   │                    # cascade.py, regexes/*.txt
+│   ├── persistence/     # models.py, sqlite.py, repository.py, resumability.py
+│   ├── reporting/       # models.py, sarif.py, exporters.py, quality_gate.py
+│   └── utils/           # exceptions.py, context.py
 ├── alembic/
 │   ├── env.py
 │   ├── script.py.mako
-│   └── versions/       # 0001_initial_schema.py
+│   └── versions/         # 0001_initial_schema.py
+├── .github/workflows/
+│   └── cyberjection.yml  # CI/CD security evaluation gate
+├── .gitlab-ci.yml        # GitLab CI equivalent
 ├── examples/
 │   └── quickstart.yaml
 ├── tests/

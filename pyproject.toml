@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cyberjection"
-version = "0.5.0"
+version = "0.6.0"
 description = "Enterprise-grade asynchronous LLM red-teaming and security orchestration framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -43,7 +43,7 @@ onnx = [
 ]
 
 [project.scripts]
-cyberjection = "apps.cli.main:app"
+cyberjection = "cyberjection.cli.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cyberjection"]

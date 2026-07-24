@@ -2,6 +2,146 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.6.0] - Phase 6: CI/CD Pipeline Integration, CLI Harness & Enterprise Reporting
+
+### Added
+
+- `cyberjection/cli/main.py`: the `cyberjection` Typer + Rich CLI with
+  three commands. `run` loads a campaign config, resolves `--target`,
+  executes the (currently stubbed) evaluation pipeline, applies the
+  quality gate, renders a Rich summary table, and optionally writes
+  SARIF/JSON/Markdown reports. `inspect` browses persisted campaign
+  history via `CampaignRepository.list_recent_campaigns`. `export`
+  re-renders a prior `run --json-out` report into SARIF or Markdown
+  without re-running an evaluation.
+- `cyberjection/reporting/models.py`: `Finding` (the typed shape every
+  Phase 6 exporter consumes, replacing the design spec's raw
+  `dict["rule_id"]`-style results) and `QualityGateResult`.
+- `cyberjection/reporting/sarif.py`: `SARIFReporter`, exporting findings as
+  SARIF 2.1.0 for GitHub Advanced Security / GitLab Security Dashboard
+  ingestion.
+- `cyberjection/reporting/exporters.py`: `JSONExporter` (machine-readable
+  audit log with a summary block) and `MarkdownExporter` (executive
+  pass/fail summary with a per-finding table).
+- `cyberjection/reporting/quality_gate.py`: `evaluate_quality_gate()` (a
+  pure pass/fail decision -- a finding scoring at or above the threshold
+  fails the gate) and `resolve_threshold()` (CLI flag > campaign YAML >
+  hardcoded default `7.0`, with `0.0` treated as a legitimate explicit
+  threshold rather than "not given").
+- `QualityGateConfig` (`cyberjection/config/schema.py`): an optional
+  `quality_gate.threshold` section on `CampaignConfig`, so a threshold can
+  travel with a campaign's version-controlled YAML.
+- `CampaignRepository.list_recent_campaigns()`
+  (`cyberjection/persistence/repository.py`): newest-first campaign
+  listing, the `inspect` command's data source -- nothing before Phase 6
+  needed to enumerate campaigns rather than look one up by known id.
+- `UnknownTargetError` (`cyberjection/utils/exceptions.py`): raised when
+  `--target` references an id absent from the loaded campaign config.
+- `.github/workflows/cyberjection.yml` and `.gitlab-ci.yml`: reusable
+  pull-request security gates running `cyberjection run` and uploading the
+  SARIF report as a build artifact / GitHub code-scanning upload.
+- Unit test suite: `test_cli.py`, `test_sarif_exporter.py`,
+  `test_exporters.py`, `test_quality_gate.py`, plus new cases in
+  `test_repository.py` for `list_recent_campaigns`.
+
+### Fixed
+
+- The Phase 6 design spec's own `SARIFReporter.export` sketch hardcoded
+  the error/warning severity split at a fixed score of `7.0`, independent
+  of whatever `--threshold` the run actually used -- a finding scoring 5.0
+  under a `--threshold 4.0` run had already failed that run's gate but
+  would still be reported as `note`/`warning` in the SARIF output. Fixed
+  by threading the effective threshold through `export()` so SARIF
+  severity always agrees with the quality-gate decision for the same run.
+- The spec's `SARIFReporter.export` sketch appended one `rules` catalog
+  entry per finding with no deduplication, so a rule id that fired on more
+  than one test case would appear multiple times in `tool.driver.rules`
+  under different `ruleIndex` values -- SARIF's `rules` array is meant to
+  be a one-entry-per-rule-id catalog referenced *by* `ruleIndex`, not a
+  per-result log. Fixed by keying the catalog on `rule_id`, deduplicated;
+  every result referencing a repeated rule id now points at that rule's
+  single catalog entry.
+- The spec's Task 6.5 asks for thresholds in a flat top-level
+  `cyberjection/config.py` module, which does not exist in this codebase
+  -- configuration has been the `cyberjection.config` *package*
+  (`schema.py` + `loader.py`) since Phase 1. Threaded the threshold
+  through as `QualityGateConfig` on `CampaignConfig` instead, consistent
+  with how `RateLimitConfig`/`StrategyConfig` already work.
+- The spec's GitHub Actions workflow sketch installs dependencies via
+  `pip install poetry && poetry install`. This project has never used
+  Poetry -- `pyproject.toml` has declared a `hatchling` build backend with
+  a plain `pip install -e ".[dev]"` flow since Phase 1, and no
+  `poetry.lock` exists anywhere in the repo. The shipped workflow (and its
+  new GitLab CI counterpart) installs and invokes the project the same way
+  every other phase's documented Quickstart does.
+- `pyproject.toml`'s `[project.scripts]` entry has pointed
+  `cyberjection = "apps.cli.main:app"` at a module that has never existed
+  in this repository (no `apps/` directory) since it was first declared in
+  Phase 1, anticipating a CLI that hadn't been built yet. Fixed to point at
+  the real `cyberjection.cli.main:app` built this phase.
+
+### Known limitations
+
+- `_execute_pipeline()` (`cyberjection/cli/main.py`) is an explicit stub
+  returning fixed findings rather than actually invoking the Phase 2-5
+  attack/evaluator machinery (mutators, single-turn strategies, the
+  cascade evaluator, Crescendo/TAP) against the resolved target. Wiring a
+  real orchestrated run is out of scope for every phase shipped so
+  far -- Phase 4's and Phase 5's changelogs both note that no
+  orchestrator loop exists yet -- and this stub is shaped exactly like the
+  eventual real implementation (same signature, same return type) so a
+  later phase only needs to replace its body.
+- `inspect` depends on the Phase 4 persistence layer (SQLAlchemy +
+  aiosqlite); when those aren't installed it reports a clear environment
+  error (exit code 3) rather than a traceback, but there is nothing to
+  browse until they are.
+- SARIF export validates structurally against a locally-authored minimal
+  SARIF 2.1.0 schema subset (see `test_sarif_exporter.py`), not the full
+  official ~300KB `sarif-schema-2.1.0.json` -- this sandbox has no network
+  access to fetch it for validation.
+
+### Offline test harness changes
+
+Extending and hard-testing this phase surfaced three real, previously
+latent bugs in the offline verification tooling itself (not shipped as
+part of the deliverable):
+
+- The offline `typer` shim (built directly on the real `click` library,
+  since this sandbox has no network access to install `typer`/`rich`)
+  originally passed an explicit `default=None` to every `click.Option`,
+  including required ones. Click 8.4's `Sentinel.UNSET` model only enforces
+  a missing required option when its default is still the sentinel --
+  an explicit `default=None` satisfies `consume_value()` before the
+  required check ever runs, silently defeating `required=True` for every
+  Optional-typed required CLI option (`--target` could be omitted with no
+  error). Caught by a test asserting a `--target`-less invocation exits 2;
+  fixed by omitting the `default` kwarg entirely for required options.
+- The offline `rich.console.Console` shim resolved `sys.stdout` once at
+  object-construction time (module import time) rather than dynamically on
+  each `print()` call. `click.testing.CliRunner` captures output by
+  reassigning the `sys.stdout` module attribute for the duration of an
+  invocation, not by mutating the stream in place, so a `Console` built
+  before any `CliRunner.invoke()` call held a stale reference and every
+  `console.print()` silently bypassed test capture, writing straight to
+  the real terminal instead. Caught when CLI tests asserting on
+  `result.output` failed despite correct exit codes and correctly printed
+  (real, terminal-visible) text. Fixed by resolving `sys.stdout` lazily via
+  a `file` property, matching real `rich.console.Console`'s own behavior.
+- The offline `pydantic` shim's `BaseModel` had no `__eq__`, so two
+  separately constructed model instances with identical field values
+  compared unequal by object identity -- caught by a `Finding` JSON
+  round-trip test. Fixed by adding value-based equality (type + `model_dump()`
+  comparison), matching real pydantic v2.
+- `run_tests.py` (the offline test collector/runner) only scanned
+  `tests/conftest.py` for `@pytest.fixture`-decorated functions, not
+  fixtures declared directly in a test module. Every earlier phase's
+  module-level fixture usage happened to live in files this sandbox skips
+  entirely (missing `sqlalchemy`), so the gap went undetected until
+  `test_cli.py`, the first offline-runnable file to declare one. Fixed by
+  scanning each test module for its own fixtures in addition to
+  conftest.py's, with module-level fixtures taking precedence on a name
+  collision (matching real pytest's closer-scope-wins resolution).
+
 ## [0.5.0] - Phase 5: Stateful Multi-Turn Adaptive Attack Engine
 
 ### Added
