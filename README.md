@@ -11,17 +11,20 @@ Full documentation lives in [`docs/`](docs/):
 - [Architecture](docs/ARCHITECTURE.md) - system design and component layout
 - [Configuration reference](docs/CONFIGURATION.md) - the YAML campaign schema
 - [Testing guide](docs/TESTING.md) - running and extending the test suite
+- [Security policy](docs/SECURITY.md) - hardening controls and vulnerability disclosure
+- [Compliance self-assessment](docs/COMPLIANCE.md) - OWASP ASVS 4.0 / SOC 2 control mapping
 - [Changelog](CHANGELOG.md) - release notes per phase
 
 ## Status
 
-Phases 1-7 of the project roadmap are implemented: **Core Async
+Phases 1-8 of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
 Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
 Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, **CI/CD
-Pipeline Integration, CLI Harness & Enterprise Reporting**, and
-**Distributed Worker Architecture, Task Queues & Rate Limiting Engine**. See
+Pipeline Integration, CLI Harness & Enterprise Reporting**,
+**Distributed Worker Architecture, Task Queues & Rate Limiting Engine**, and
+**Security Auditing, Compliance & Production Hardening**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
 plan and what ships in each stage.
 
@@ -154,6 +157,25 @@ plan and what ships in each stage.
   cluster-wide early-termination signals, wired directly to the Phase 3
   `Verdict` type -- a `Verdict.FAIL` can abort in-flight work on every
   worker node, not just the one that produced it.
+
+### Phase 8: security auditing, compliance & production hardening
+
+- Output-path containment (`assert_safe_output_path`), a literal-value
+  SSRF guard for target URLs (`assert_safe_target_url`), and a payload
+  size ceiling (`enforce_payload_size_limit`), wired into every CLI
+  command that accepts a file path, target config, or response body.
+- `AuditLogger`: a SHA-256 hash-chained, append-only audit trail. Every
+  `run`/`inspect`/`export`/`audit` invocation writes an entry;
+  `verify_chain()` detects any tampering with an existing entry.
+- `cyberjection audit`: dependency vulnerability scanning (`--deps`, via
+  the real `pip-audit` tool), hardcoded-secret scanning (`--secrets`,
+  source tree and campaign YAML), informational target-URL checks
+  (`--targets`), and an OWASP ASVS 4.0 / SOC 2 control self-assessment
+  (`--compliance`) -- combinable into one Markdown report (`--report`).
+- New CI job (`hardening-gate` in both `.github/workflows/cyberjection.yml`
+  and `.gitlab-ci.yml`): fails the build on a known dependency
+  vulnerability or a hardcoded secret, independent of the evaluation
+  quality gate.
 
 ## Installation
 
@@ -292,6 +314,18 @@ cyberjection inspect --limit 5     # browse recent persisted campaigns
 cyberjection export --from-json results.json --output results.md --format markdown
 ```
 
+Audit this project's own dependencies and configuration for known
+vulnerabilities and hardcoded secrets:
+
+```bash
+pip install -e ".[security]"   # installs pip-audit
+
+cyberjection audit --deps --secrets --targets --config examples/quickstart.yaml
+cyberjection audit --compliance --report audit-report.md
+# exits 0 (clean) or 1 (a check found something); --targets never fails
+# the gate on its own -- it's informational, see docs/SECURITY.md
+```
+
 ## Project layout
 
 ```
@@ -309,6 +343,8 @@ cyberjection/
 │   ├── persistence/     # models.py, sqlite.py, repository.py, resumability.py
 │   ├── reporting/       # models.py, sarif.py, exporters.py, quality_gate.py
 │   ├── distributed/     # celery_app.py, rate_limiter.py, coordinator.py, retry.py, tasks.py
+│   ├── security/        # input_validation.py, audit_log.py, secrets_audit.py,
+│   │                    # dependency_audit.py, compliance.py
 │   └── utils/           # exceptions.py, context.py
 ├── alembic/
 │   ├── env.py

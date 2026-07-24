@@ -1,9 +1,10 @@
-# GitLab CI security evaluation gate (Phase 6, Task 6.4), mirroring
-# .github/workflows/cyberjection.yml so the same quality-gate behavior
-# (non-zero exit on threshold breach, SARIF/JSON artifacts) is available to
-# GitLab-hosted forks/mirrors of this repository. Installs via
-# `pip install -e ".[dev]"`, matching this project's actual hatchling-based
-# build (see the note in cyberjection.yml about why this isn't Poetry).
+# GitLab CI security evaluation gate (Phase 6, Task 6.4; Phase 8 adds
+# hardening-gate), mirroring .github/workflows/cyberjection.yml so the same
+# quality-gate behavior (non-zero exit on threshold breach, SARIF/JSON
+# artifacts) is available to GitLab-hosted forks/mirrors of this repository.
+# Installs via `pip install -e ".[dev]"`, matching this project's actual
+# hatchling-based build (see the note in cyberjection.yml about why this
+# isn't Poetry).
 stages:
   - test
   - security
@@ -46,6 +47,30 @@ security-eval:
     paths:
       - results.sarif
       - results.json
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+hardening-gate:
+  # Phase 8: dependency vulnerability + hardcoded-secret gate, independent
+  # of the evaluation quality gate above -- see the matching job note in
+  # .github/workflows/cyberjection.yml.
+  stage: security
+  image: python:3.12-slim
+  needs: ["unit-tests"]
+  script:
+    - python -m pip install --upgrade pip
+    - pip install -e ".[dev,security]"
+    - >
+      cyberjection audit
+      --deps
+      --secrets
+      --fail-on-unavailable
+      --report hardening-report.md
+  artifacts:
+    when: always
+    paths:
+      - hardening-report.md
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'

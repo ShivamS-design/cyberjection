@@ -11,3 +11,5 @@ htmlcov/
 *.db
 dist/
 build/
+.cyberjection/
+hardening-report.md

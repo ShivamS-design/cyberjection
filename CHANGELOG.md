@@ -2,6 +2,173 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.8.0] - Phase 8: Security Auditing, Compliance & Production Hardening
+
+No PDF design spec exists for this phase (unlike every phase before it);
+scope was self-authored from the Phase 7 changelog's own roadmap line --
+"Security auditing, compliance & production hardening" -- plus explicit
+user direction to include a formal ASVS/SOC2 control mapping rather than
+just a practical hardening checklist.
+
+### Added
+
+- `cyberjection/security/input_validation.py`: `assert_safe_output_path`
+  (relative-path/symlink containment for report-writing CLI flags,
+  passing explicit absolute paths through unchanged),
+  `assert_safe_target_url` (literal-IP SSRF guard rejecting
+  private/loopback/link-local/reserved/blocked-hostname target URLs by
+  default, with an explicit `allow_private_networks` opt-in), and
+  `enforce_payload_size_limit` (byte-measured payload size ceiling).
+- `cyberjection/security/audit_log.py`: `AuditLogger`/`AuditEvent`/
+  `verify_chain`, a SHA-256 hash-chained append-only JSONL audit trail.
+  Every `run`/`inspect`/`export`/`audit` CLI invocation now logs an entry;
+  `verify_chain()` detects tampering with any existing entry and reports
+  the first broken index.
+- `cyberjection/security/secrets_audit.py`: `scan_text_for_secrets` /
+  `scan_paths_for_secrets` (AWS keys, PEM private key headers, Slack/GitHub
+  tokens, generic API-key assignments, with placeholder-value suppression)
+  and `scan_campaign_config_for_hardcoded_secrets` (flags a literal, non-
+  `${VAR}`-interpolated `api_key` value in campaign YAML). Every reported
+  excerpt is redacted -- the raw secret is never printed.
+- `cyberjection/security/dependency_audit.py`: `run_dependency_audit` /
+  `parse_pip_audit_json` / `evaluate_dependency_gate`, shelling out to the
+  real `pip-audit` tool against the live PyPA Advisory Database rather
+  than shipping a hand-maintained, staleness-prone offline CVE list.
+  Reports an honest `source="unavailable"` state (not a false "clean"
+  result) when `pip-audit` isn't installed; `--fail-on-unavailable` turns
+  that into a hard failure for CI.
+- `cyberjection/security/compliance.py`: `CONTROL_REGISTRY` (18 controls:
+  9 `IMPLEMENTED`, 6 `PARTIAL`, 3 `NOT_APPLICABLE`, 0 `NOT_IMPLEMENTED`),
+  `generate_compliance_report()`, and `compliance_summary()` -- an OWASP
+  ASVS 4.0 / SOC 2 (2017) control self-assessment with every row linked
+  to real code or test evidence, explicitly labeled a self-assessment
+  rather than a certification.
+- `cyberjection audit` CLI command: `--deps`, `--secrets` (with
+  repeatable `--path`), `--targets` (informational only, requires
+  `--config`), `--compliance`, `--report` (combined Markdown output), and
+  `--fail-on-unavailable`. With no flags, defaults to `--deps --secrets`
+  over the current directory.
+- `_safe_output_path()` wired into `run`'s `--sarif-out`/`--json-out`/
+  `--markdown-out` and `export`'s `--output`; `_audit_logger.log(...)`
+  calls added at entry/success/failure points across `run`, `inspect`,
+  `export`, and `audit`.
+- New `hardening-gate` CI job in both `.github/workflows/cyberjection.yml`
+  and `.gitlab-ci.yml`: installs the new `security` optional-dependency
+  extra (`pip-audit>=2.7`), runs `cyberjection audit --deps --secrets
+  --fail-on-unavailable --report hardening-report.md`, and uploads the
+  report as a build artifact -- independent of the existing evaluation
+  quality-gate job, so a hardening finding is distinguishable from a
+  target-evaluation failure.
+- `docs/SECURITY.md` (vulnerability disclosure process and a walkthrough
+  of every Phase 8 control) and `docs/COMPLIANCE.md` (the generated
+  control-mapping table, with a "reading the PARTIAL entries" section).
+- Unit test suite: `test_input_validation.py`, `test_audit_log.py`
+  (including a genuine 10-thread/200-entry concurrent-append race
+  verified via `verify_chain`), `test_secrets_audit.py`,
+  `test_dependency_audit.py` (exercising the real, unstubbed
+  `source="unavailable"` fallback in this sandbox rather than mocking
+  it), `test_compliance.py`, and a new `TestAuditCommand` class plus
+  path-traversal regression cases in `test_cli.py`.
+- New exceptions: `PathTraversalError`, `UnsafeTargetURLError`,
+  `PayloadTooLargeError`, `DependencyAuditError`.
+- `pip-audit>=2.7` added as a new `security` optional-dependency extra in
+  `pyproject.toml` (not a hard dependency -- see the dependency-audit
+  honesty note above for why an uninstalled optional extra degrades
+  gracefully instead of failing).
+
+### Fixed
+
+- **Output-path containment was initially too strict for real usage.**
+  The first version of `assert_safe_output_path` rejected any path --
+  relative *or* absolute -- that resolved outside `base_dir`, matching a
+  literal reading of "contain the output path." Wiring this into the CLI
+  with `base_dir=Path.cwd()` broke the ordinary case of writing a report
+  to an explicit absolute location outside the working tree (a CI
+  artifacts mount, `/tmp`, a `pytest tmp_path` fixture) -- caught by this
+  phase's own `test_cli.py::TestRunExportFlags` and `TestExportCommand`
+  tests failing against real absolute output paths, not a synthetic
+  traversal string. Fixed by scoping the containment check to *relative*
+  inputs only (the case an unexpected `..` segment or symlink can
+  actually smuggle an escape through); an explicit absolute path is now
+  treated as the operator's deliberate choice and passed through
+  unchanged. See `assert_safe_output_path`'s docstring for the full
+  reasoning, and the corresponding `PathTraversalError` docstring update.
+- The offline `typer` shim (`/tmp/_shims/typer/`, environment-local, not
+  shipped) had no support for `List[X]`-typed options at all -- a
+  `scan_paths: Optional[List[Path]] = typer.Option(None, "--path", ...)`
+  parameter was silently parsed as a single string, and iterating "for
+  root in paths" then iterated the string's individual *characters* as
+  paths (visible as `Scanning for hardcoded secrets in: /, s, e, s, s,
+  ...` in test output), which in turn made `scan_paths_for_secrets`
+  attempt `Path("/").rglob("*")` across the entire filesystem and crash
+  on a permission-denied `/proc` entry. Extended the shim to detect
+  `List[X]`/`Optional[List[X]]` annotations and build the underlying
+  `click.Option` with `multiple=True`, defaulting to `()` rather than
+  `None` to match real click's `multiple=True` contract.
+- The offline `pytest` shim's `fixture()` didn't accept an `autouse`
+  keyword at all (`TypeError: fixture() got an unexpected keyword
+  argument 'autouse'`), and even after adding the keyword, the offline
+  test runner (`run_tests.py`) only ever resolved fixtures a test
+  function explicitly named as a parameter -- it had no concept of a
+  fixture applying automatically. This phase's `test_cli.py` is the first
+  test file in the project to need an autouse fixture (isolating the
+  CLI's `_audit_logger` singleton to a per-test temp path rather than
+  writing real audit entries into the CI working directory). Extended
+  both the shim's `fixture(autouse=True)` support and the runner's
+  `call_with_fixtures()` to resolve and invoke every autouse fixture in
+  scope for a test, whether or not it appears in that test's signature.
+- The offline `pytest` shim's `MonkeyPatch` had no `chdir()` method; this
+  phase's path-traversal and `Path.cwd()`-relative CLI tests need it to
+  exercise `_safe_output_path`'s real working-directory-relative
+  behavior rather than only testing it indirectly. Added `chdir()` with
+  proper `undo()` restoration alongside the existing `setattr`/`setenv`/
+  `delenv` support.
+
+### Known limitations
+
+- The SSRF guard (`assert_safe_target_url`) is a literal-value check
+  only -- it does not perform DNS resolution, so a hostname (as opposed
+  to a literal IP) that resolves to a private/internal address is not
+  caught at validation time, and even a literal-IP check can't close a
+  DNS-rebinding gap at actual connection time. Reflected honestly as
+  `PARTIAL` (not `IMPLEMENTED`) in `docs/COMPLIANCE.md`'s ASVS-V9.1 entry.
+  `assert_safe_target_url` is not currently called from
+  `TargetConfig`/config-load time -- only from the `audit --targets`
+  informational check -- since an operator's own local campaign YAML is
+  not equivalent to untrusted attacker input in this project's current
+  single-operator CLI threat model, and hard-enforcing it at load time
+  would risk breaking legitimate Ollama/vLLM localhost configurations
+  without a fully-designed allowlist policy.
+- `AuditLogger`'s hash chain is tamper-*evident*, not tamper-*proof*: an
+  attacker with filesystem write access to the log file can truncate it
+  and start a fresh chain from `GENESIS_HASH`, undetectable by
+  `verify_chain()` alone, since there's no append-only filesystem
+  enforcement or remote log shipping in this phase.
+- `run_dependency_audit()` depends on `pip-audit` being installed (the
+  new `security` extra) and, in most environments, on network access to
+  query the live PyPA Advisory Database -- neither is available in this
+  project's own offline hard-testing sandbox, so `test_dependency_audit.py`
+  necessarily exercises the honest `source="unavailable"` fallback path
+  rather than a real, populated report.
+- The secrets scanner is pattern-based (structural key-shape matching), not
+  entropy-based -- it will miss a credential in an unrecognized format and
+  can, in principle, false-positive on a high-entropy string that happens
+  to match a generic assignment pattern. It's a defense-in-depth check,
+  not a replacement for a dedicated secret-scanning service.
+- None of this phase's controls address the security of a *target* model
+  or the systems it's evaluated against -- they harden Cyberjection's own
+  operation (CLI inputs, its own dependencies, its own audit trail), not
+  the system under test.
+
+### Offline test harness changes
+
+See the "Fixed" section above for the three offline-shim changes this
+phase required (`List[X]` typer option support, `pytest.fixture(autouse=True)`
+support in both the shim and the runner, and `MonkeyPatch.chdir()`) --
+all three are environment-local files under `/tmp/_shims/`, not part of
+the shipped package, and none of the actual test files depend on shim
+internals beyond the documented `typer`/`pytest` surface they already used.
+
 ## [0.7.0] - Phase 7: Distributed Worker Architecture, Task Queues & Rate Limiting Engine
 
 ### Added
