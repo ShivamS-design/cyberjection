@@ -9,7 +9,7 @@ persistence and reporting.
 
 ```
  PRESENTATION LAYER
-   apps/cli (Typer) | apps/api (FastAPI) | apps/dashboard (React)
+   cyberjection/cli (Typer) | apps/api (FastAPI) | apps/dashboard (React)
           |
           v  YAML / REST API
  ORCHESTRATION LAYER
@@ -35,7 +35,7 @@ persistence and reporting.
           v  evaluation verdict & findings
  PERSISTENCE & REPORTING LAYER
    SQLAlchemy 2 (SQLite / PostgreSQL) + Redis queue
-   SARIF v2.1.0, interactive HTML (Jinja2), JSON, CSV
+   cyberjection/reporting: SARIF v2.1.0, JSON, Markdown
 ```
 
 ## Design principles
@@ -202,7 +202,7 @@ restarting from scratch.
 |---|---|
 | `cyberjection/persistence/models.py` | SQLAlchemy 2 declarative schema (`Mapped`/`mapped_column` style): `CampaignModel`, `TestModel`, `TurnModel`, `FindingModel`, `MetricModel`, with cascading foreign keys and query-pattern indexes. |
 | `cyberjection/persistence/sqlite.py` | `DatabaseManager`: builds the async SQLite engine (`aiosqlite`), applies WAL journaling, and creates the schema. Owns the per-connection pragma fix described below. |
-| `cyberjection/persistence/repository.py` | `CampaignRepository`: the DAO every write and query in the execution engine goes through -- campaign/test lifecycle, turn/finding/metric recording, and the execution-state queries resumability needs. |
+| `cyberjection/persistence/repository.py` | `CampaignRepository`: the DAO every write and query in the execution engine goes through -- campaign/test lifecycle, turn/finding/metric recording, and the execution-state queries resumability (and, in Phase 6, the CLI's `inspect` command) need. |
 | `cyberjection/persistence/resumability.py` | Pure reconciliation logic (`build_resume_map`, `reconcile_test_state`, `decide_resume_action`) plus `ResumabilityManager`, the thin database-facing wrapper around it. |
 | `alembic/` | Hand-authored initial migration (`versions/0001_initial_schema.py`) mirroring `models.py` exactly, plus an async-engine-compatible `env.py`. |
 
@@ -327,6 +327,9 @@ target safely resisted) maps to a low score and `is_refusal=True`;
 without asserting a refusal happened. Centralizing this in one function
 (rather than letting each engine grow its own conversion) is what keeps
 Crescendo's and TAP's success/pruning thresholds comparable to each other.
+Phase 6's `evaluate_quality_gate` reuses the same 0-10 scale via `Finding.score`,
+so a CI/CD threshold means the same thing whether it's judging a single-turn
+attack, a multi-turn Crescendo run, or a TAP search.
 
 ### Crescendo: escalation with backtracking
 
@@ -370,6 +373,68 @@ orchestrator wiring landed. `TAPEngine`'s branch count grows as
 attacker + evaluator calls; `pruning_threshold` is the only cost control
 until campaign-level budget wiring exists.
 
+## Phase 6: CI/CD Pipeline Integration, CLI Harness & Enterprise Reporting
+
+Builds the operator- and pipeline-facing surface on top of every prior
+phase: a command-line harness to drive evaluations, and a reporting layer
+that turns evaluation results into formats CI/CD systems and security
+tooling already understand.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/cli/main.py` | The `cyberjection` Typer + Rich CLI: `run` (execute + gate + optionally export), `inspect` (browse persisted campaign history), `export` (re-render a prior JSON report into another format). |
+| `cyberjection/reporting/models.py` | `Finding` (the typed result shape every exporter consumes) and `QualityGateResult`. |
+| `cyberjection/reporting/sarif.py` | `SARIFReporter`: exports findings as SARIF 2.1.0. |
+| `cyberjection/reporting/exporters.py` | `JSONExporter` and `MarkdownExporter`: machine-readable and executive-summary audit formats. |
+| `cyberjection/reporting/quality_gate.py` | `evaluate_quality_gate()` (pure pass/fail decision) and `resolve_threshold()` (CLI flag > campaign YAML > default). |
+| `.github/workflows/cyberjection.yml`, `.gitlab-ci.yml` | Reusable CI/CD security-evaluation gates. |
+
+### The CLI's exit-code contract
+
+`cyberjection run` uses four distinct exit codes rather than a bare
+pass/fail: `0` (quality gate passed), `1` (the run executed correctly but a
+finding breached the configured threshold), `2` (a usage/configuration
+error caught before any evaluation ran -- bad config file, unknown target
+id, missing input file), and `3` (a command's runtime dependency, e.g.
+SQLAlchemy for `inspect`, isn't installed). Separating `1` from `2` matters
+for CI/CD specifically: a pipeline should treat "the security gate found a
+real problem" (fail the build, look at the report) very differently from
+"the pipeline is misconfigured" (fail the build, look at the CLI's own
+error message) -- collapsing both into a single non-zero exit would make
+that triage a manual step every time.
+
+### Report exporters share one typed `Finding`, not per-exporter dicts
+
+The Phase 6 design spec's own CLI sketch passed a list of raw `dict`
+results (`item["rule_id"]`, `item["score"]`, ...) into each exporter. A
+`Finding` Pydantic model (`cyberjection/reporting/models.py`) replaces that:
+every exporter, and the quality gate, take the same typed value, so a
+producer that forgets a field or misnames one fails at construction time
+rather than at export time -- after a real evaluation run has already spent
+real target/attacker/judge calls.
+
+### SARIF severity is threshold-relative, and rules are deduplicated
+
+Two bugs in the design spec's own `SARIFReporter.export` sketch are fixed
+in the shipped version (see the Phase 6 changelog entry for the full
+detail): severity levels are derived from the run's actual `--threshold`
+instead of a value hardcoded at `7.0`, and the `rules` catalog is
+deduplicated by `rule_id` instead of growing one entry per finding --
+important because SARIF's `rules` array is meant to be a one-entry-per-rule
+catalog referenced *by* `ruleIndex`, not a per-result log.
+
+### The `run` pipeline is a documented stub
+
+`_execute_pipeline()` in `cli/main.py` returns fixed findings rather than
+actually invoking the Phase 2-5 attack/evaluator machinery against the
+resolved target -- see [Cost and orchestration status](#cost-and-orchestration-status)
+above and the Known Limitations section of the Phase 6 changelog entry.
+It's shaped exactly like the eventual real implementation (same
+parameters, same `List[Finding]` return type) specifically so wiring in a
+real orchestrated run later is a body replacement, not an interface
+change for every caller (the CLI, and any future orchestrator entrypoint)
+that already depends on it.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -378,11 +443,11 @@ until campaign-level budget wiring exists.
 | 2 | Mutation engine (Base64, Homoglyph, Typoglycemia, Unicode zero-width, ROT13/Caesar) & single-turn attack generators (direct injection, jailbreak/roleplay, system prompt extraction) |
 | 3 | Three-tier cascade evaluation pipeline (regex -> local ONNX -> LLM judge) |
 | 4 | Persistence layer, SQLAlchemy database models, campaign resumability |
-| 5 (current) | Stateful multi-turn adaptive attack engine (Crescendo, TAP) |
-| 6 | Command-line interface (Typer + Rich) |
+| 5 | Stateful multi-turn adaptive attack engine (Crescendo, TAP) |
+| 6 (current) | CI/CD pipeline integration, CLI harness (Typer + Rich), enterprise reporting (SARIF, JSON, Markdown) |
 | 7 | FastAPI REST backend & async task queue (Redis + Celery/Dramatiq) |
 | 8 | React web dashboard & real-time monitoring console |
-| 9 | Enterprise reporting (SARIF, HTML) & CI/CD security gates |
+| 9 | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack |
 | 10 | Plugin architecture, security hardening, container deployment |
 
 ## Data model
@@ -409,8 +474,10 @@ The Phase 5 attack tree (`ConversationContext.nodes` / `AttackNode`) is not
 yet persisted through this schema -- `TurnModel` records a single
 prompt/response pair per turn number, while an `AttackNode` additionally
 carries score, status, and tree-branching (`parent_id`) that don't have a
-column home yet. Wiring multi-turn attack trees into the persistence layer
-is orchestrator work reserved for a later phase.
+column home yet. The Phase 6 `Finding` model is likewise a reporting-layer
+value, not a persisted row -- it has no `FindingModel` foreign key back to
+a specific evaluation the way `FindingModel` does. Wiring both into the
+persistence layer is orchestrator work reserved for a later phase.
 
 ## Threat model summary
 
@@ -419,6 +486,7 @@ is orchestrator work reserved for a later phase.
 | Credential exposure via hardcoded API keys or logs | Environment-variable expansion keeps secrets out of YAML files; secret values are wrapped in `SecretStr` and never appear in reprs or logs. |
 | Malicious payload execution via custom plugins (Phase 10) | Sandboxed plugin runtimes and strict input validation, planned for the plugin architecture phase. |
 | Unbounded resource exhaustion from runaway multi-turn loops | `max_cost_cap` circuit breaker and `max_turns` bound (<= 25) enforced at the schema level; `TAPEngine.pruning_threshold` bounds branch survival until cost-cap wiring lands. |
+| A misconfigured CI/CD pipeline silently passing a security gate | The CLI's exit-code contract keeps a quality-gate failure (`1`) distinct from a usage/config error (`2`) and an environment error (`3`), so a pipeline can't mistake "the CLI couldn't even run" for "the target passed evaluation." |
 
 For air-gapped deployments, Tier 1 (regex) and Tier 2 (local ONNX)
 evaluation, plus a local Ollama or vLLM target, allow fully offline
@@ -427,4 +495,6 @@ enough on Tier 2 that Tier 3 is never reached) to keep every evaluation
 on-box. `AttackerAgent` still requires a real LLM call by design (it's the
 part of the system generating adversarial creativity), so fully offline
 multi-turn campaigns need a local model served through Ollama/vLLM
-configured as the attacker's `model`.
+configured as the attacker's `model`. The Phase 6 CLI and reporting layer
+have no network dependency of their own beyond whatever the pipeline it
+drives requires.

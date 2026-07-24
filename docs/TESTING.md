@@ -38,6 +38,21 @@ To run only the Phase 5 suite:
 pytest tests/unit/test_attack_state.py tests/unit/test_attacker_agent.py tests/unit/test_crescendo_engine.py tests/unit/test_tap_pruning.py -v
 ```
 
+To run only the Phase 6 suite:
+
+```bash
+pytest tests/unit/test_cli.py tests/unit/test_sarif_exporter.py tests/unit/test_exporters.py tests/unit/test_quality_gate.py -v
+
+# CLI harness smoke check
+cyberjection --help
+```
+
+`test_cli.py` calls `pytest.importorskip("typer")` at module scope, the
+same self-skip convention `test_database_models.py`/`test_repository.py`
+use for `sqlalchemy` -- in an environment with neither `typer` nor a
+compatible offline shim on `sys.path`, it skips cleanly rather than
+failing collection.
+
 ## Layout
 
 | File | Covers |
@@ -54,11 +69,15 @@ pytest tests/unit/test_attack_state.py tests/unit/test_attacker_agent.py tests/u
 | `tests/unit/test_cascade_escalation.py` | `CascadeEvaluator`: short-circuiting at each tier, zero-external-call verification on Tier 1 matches, full three-tier fallback, and correctness under concurrent `evaluate()` calls on a shared instance. |
 | `tests/unit/test_resumability_engine.py` | The pure campaign-resumability reconciliation logic against plain stand-in objects: turn-number gap detection (resuming from the first missing turn, not `max + 1`), composite-key (`target_id`, `strategy`, `seed_prompt`) collision handling, and every `ResumeDecision` branch. Has no SQLAlchemy dependency and always runs. |
 | `tests/unit/test_database_models.py` | SQLAlchemy schema creation, `ON DELETE CASCADE` behavior through `DatabaseManager`'s per-connection pragma fix, the unique `(test_id, turn_number)` constraint, and the `MetricModel` one-to-one relationship. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise. |
-| `tests/unit/test_repository.py` | `CampaignRepository`: campaign/test lifecycle, `find_test`/`list_incomplete_tests` natural-key and execution-state queries, turn/finding recording, and metric accumulation via `upsert_metrics`. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise. |
+| `tests/unit/test_repository.py` | `CampaignRepository`: campaign/test lifecycle, `find_test`/`list_incomplete_tests` natural-key and execution-state queries, turn/finding recording, metric accumulation via `upsert_metrics`, and (Phase 6) `list_recent_campaigns`'s ordering/limit/empty-database behavior. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise. |
 | `tests/unit/test_attack_state.py` | `ConversationContext` memory (`add_turn`, `pop_last_turn`), the attack-tree node index (`add_node`, `path_to`, cyclic-parent-chain safety, `best_score`), and `score_from_evaluation`'s mapping from Phase 3's `Verdict`/confidence onto Phase 5's 0-10 attack-progress scale. |
 | `tests/unit/test_attacker_agent.py` | `AttackerAgent`: structured JSON parsing, goal interpolation, conversation-history forwarding, and retry-then-`AttackerGenerationError` behavior on malformed JSON, empty responses, and missing required fields. |
 | `tests/unit/test_crescendo_engine.py` | `CrescendoEngine.run()`: exactly one `AttackNode` yielded per turn (including the backtrack-turn regression case), state-rollback correctness (a backtracked turn's exchange is absent from what's next sent to the target), `REFUSED` vs `BACKTRACK` status selection based on remaining backtrack budget, success short-circuiting before `max_turns`, and graceful termination on attacker failure. |
 | `tests/unit/test_tap_pruning.py` | `TAPEngine.execute_tree_search()`: pruning below/above the score threshold, multi-depth expansion (the loop-nesting regression case), returning the best partial path when nothing succeeds, and fault tolerance when an individual branch's attacker call fails via `asyncio.gather(return_exceptions=True)`. |
+| `tests/unit/test_cli.py` | The `cyberjection` CLI end-to-end via `typer.testing.CliRunner`: `--help`, required-option enforcement, config/target error handling, quality-gate exit codes (pass/fail/threshold-fallback-to-campaign-config), SARIF/JSON/Markdown export flags, the `export` command's format handling, and `inspect`'s environment-unavailable and rendering paths (the latter via a monkeypatched `_inspect_async`, isolating the test from needing a real database). |
+| `tests/unit/test_sarif_exporter.py` | `SARIFReporter`: structural validation against a locally-authored minimal SARIF 2.1.0 schema, rule-catalog deduplication for a repeated `rule_id`, and threshold-relative severity levels (both regression coverage for bugs in the Phase 6 design spec's own sketch). |
+| `tests/unit/test_exporters.py` | `JSONExporter` (summary block correctness, `Finding` round-trip via `model_validate`) and `MarkdownExporter` (pass/fail header, per-finding table rows, pipe-character escaping). |
+| `tests/unit/test_quality_gate.py` | `resolve_threshold`'s CLI > config > default precedence (including that an explicit `0.0` at either level is not treated as "missing") and `evaluate_quality_gate`'s pass/fail/exactly-at-threshold decision, independent of any CLI or Typer machinery. |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions
@@ -86,6 +105,15 @@ pytest tests/unit/test_attack_state.py tests/unit/test_attacker_agent.py tests/u
   fast and focused on control flow, while `test_litellm_provider.py` and
   `test_attacker_agent.py` separately cover the real classes' own behavior
   in isolation.
+- Phase 6's `test_cli.py` fixtures (`config_path`, `json_report`) are
+  declared at module scope rather than nested inside a `Test*` class, even
+  where they're only used by one class -- consistent, simple `@pytest.fixture`
+  discovery. Prefer this shape for any new CLI test fixture.
+- `test_cli.py` isolates `inspect`'s success path from needing a real
+  SQLAlchemy database by monkeypatching `cyberjection.cli.main._inspect_async`
+  itself, not just `_SQLALCHEMY_AVAILABLE` -- so the test exercises the
+  command's own table-rendering logic without depending on `sqlalchemy`
+  being installed at all.
 
 ## Adding a new provider or config field
 
@@ -183,3 +211,26 @@ pytest tests/unit/test_attack_state.py tests/unit/test_attacker_agent.py tests/u
 4. Add a dedicated test module using the `FakeTarget` / `FakeEvaluator` /
    `ScriptedAttacker` (or equivalent) pattern established in
    `test_crescendo_engine.py` and `test_tap_pruning.py`.
+
+## Adding a new CLI command or report exporter
+
+1. For a new CLI command, add a `@app.command("name")`-decorated function
+   to `cyberjection/cli/main.py`. Keep the command function itself thin:
+   argument parsing and `console.print`/`typer.Exit` calls only, with any
+   real logic factored into a plain, separately-testable function or
+   `async def` helper (see `_resolve_target`, `_inspect_async`) -- the
+   pattern that keeps `test_cli.py` able to assert on exit codes and
+   output without needing to duck-type around Typer/Click internals.
+2. For a new report format, add an `export(findings: List[Finding],
+   output_path: Path, *, threshold: float = 7.0) -> None` static method to
+   a class in `cyberjection/reporting/exporters.py` (or a new module next
+   to `sarif.py`), consuming `Finding` -- never a raw `dict` -- so it stays
+   interchangeable with the other exporters from the CLI's point of view.
+3. Add exit-code and output-content assertions to `tests/unit/test_cli.py`
+   if the change is CLI-facing; add format-specific structural assertions
+   to `tests/unit/test_sarif_exporter.py` / `test_exporters.py` (or an
+   equivalent new file) for a new exporter itself.
+4. If the change affects the pass/fail decision, add a case to
+   `tests/unit/test_quality_gate.py` rather than only testing it through
+   the CLI -- `evaluate_quality_gate`/`resolve_threshold` are meant to stay
+   testable independent of Typer.

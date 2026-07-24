@@ -39,6 +39,7 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `tests` | list of `TestCaseConfig` | `[]` | Each `target` and `strategy` reference must match a known id. |
 | `max_cost_cap` | float | `10.0` | Hard budget ceiling in USD; must be `>= 0`. |
 | `max_workers` | int | `50` | Concurrent worker cap; `1-200`. |
+| `quality_gate` | `QualityGateConfig` | see below | CI/CD pass/fail threshold (Phase 6). |
 
 ## `TargetConfig`
 
@@ -61,6 +62,23 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 |---|---|---|---|
 | `requests_per_second` | int | `10` | Paced by an async token-bucket limiter; must be `>= 1`. |
 | `burst` | int | `20` | Token-bucket capacity **and** the concurrency semaphore size; must be `>= 1`. |
+
+## `QualityGateConfig`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `threshold` | float | `7.0` | `0.0-10.0`. Findings scoring at or above this value fail the `cyberjection run` quality gate. |
+
+```yaml
+quality_gate:
+  threshold: 5.0
+```
+
+The `cyberjection run` CLI's `--threshold` flag, when given, overrides this
+value for that one invocation; omitting `--threshold` falls back to the
+campaign's declared `quality_gate.threshold`, then to a hardcoded `7.0` if
+neither is set. See
+[`cyberjection.reporting.quality_gate.resolve_threshold`](#cli-cyberjection).
 
 ## `StrategyConfig`
 
@@ -220,6 +238,61 @@ Neither engine is yet wired to `StrategyConfig.max_turns` or campaign YAML;
 both are constructed directly in Python for now, the same interim state
 Phase 2's mutator pipeline and Phase 3's cascade evaluator shipped in
 before orchestrator wiring landed.
+
+## CLI: `cyberjection`
+
+Phase 6 adds a Typer + Rich command-line harness, installed as the
+`cyberjection` console script:
+
+```bash
+cyberjection run --config examples/quickstart.yaml --target support-agent \
+  --threshold 7.0 --sarif-out results.sarif --json-out results.json --markdown-out results.md
+cyberjection inspect --limit 10
+cyberjection export --from-json results.json --output results.sarif --format sarif
+```
+
+| Command | Key options | Notes |
+|---|---|---|
+| `run` | `--config`/`-c` (default `cyberjection.yaml`), `--target`/`-t` (required), `--threshold`, `--sarif-out`, `--json-out`, `--markdown-out` | Loads the campaign config, resolves the target, runs the evaluation pipeline, applies the quality gate, and exits `0`/`1`/`2` (see below). `--threshold` overrides the campaign's `quality_gate.threshold`; omitting both falls back to `7.0`. |
+| `inspect` | `--db-url`, `--limit` (default `10`) | Lists recently persisted campaigns via `CampaignRepository.list_recent_campaigns`. Requires the Phase 4 persistence layer (`sqlalchemy`, `aiosqlite`). |
+| `export` | `--from-json` (required), `--output`/`-o` (required), `--format`/`-f` (`sarif` or `markdown`, default `sarif`), `--threshold` | Re-renders a prior `run --json-out` report into another format without re-running an evaluation. |
+
+**Exit codes:** `0` quality gate passed, `1` quality gate failed (the run
+executed correctly but a finding met or exceeded the threshold), `2` a
+usage/configuration error (bad config file, unknown target id, missing
+input file), `3` an environment error (a command's runtime dependency
+isn't installed, e.g. `inspect` without `sqlalchemy`).
+
+`_execute_pipeline()` behind `run` is currently a documented stub
+returning fixed findings rather than invoking the real Phase 2-5
+attack/evaluator stack -- see
+[Cost and orchestration status](ARCHITECTURE.md#cost-and-orchestration-status)
+in the architecture doc.
+
+## Reporting: SARIF, JSON, Markdown
+
+`cyberjection.reporting` (Phase 6) turns a list of `Finding` objects into
+enterprise-consumable report formats, independent of the CLI:
+
+```python
+from cyberjection.reporting import Finding, SARIFReporter, JSONExporter, MarkdownExporter
+
+findings = [Finding(rule_id="CJ-001", category="prompt_injection", score=8.2, details="...")]
+SARIFReporter.export(findings, "results.sarif", threshold=7.0)
+JSONExporter.export(findings, "results.json", threshold=7.0)
+MarkdownExporter.export(findings, "results.md", threshold=7.0)
+```
+
+| Exporter | Format | Notes |
+|---|---|---|
+| `SARIFReporter` | SARIF 2.1.0 JSON | For GitHub Advanced Security / GitLab Security Dashboard ingestion. `level` (`error`/`warning`/`note`) is derived from `threshold`, not a fixed cutoff; the `rules` catalog is deduplicated by `rule_id`. |
+| `JSONExporter` | JSON | A `summary` block (`total_findings`, `failing_findings`, `max_score`, `gate_passed`) plus the full `findings` list, each round-trippable back into `Finding` via `Finding.model_validate`. |
+| `MarkdownExporter` | Markdown | An executive pass/fail header plus a per-finding table; pipe characters in `details` are escaped so the table doesn't break. |
+
+`cyberjection.reporting.quality_gate.evaluate_quality_gate(findings,
+threshold)` is the pure decision function both the CLI and any future
+caller should use rather than re-deriving pass/fail inline: a finding
+scores at or above `threshold` fails the gate.
 
 ## Full example
 
