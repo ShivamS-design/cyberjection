@@ -313,3 +313,67 @@ class TestResponseEdgeCases:
         target = LiteLLMTarget(_target_config())
         response = await target.generate("hi")
         assert response.content == ""
+
+
+@pytest.mark.asyncio
+class TestLiteLLMTargetGenerateConversation:
+    """Covers `generate_conversation`, added in Phase 5 so multi-turn attack
+    engines can replay a full, caller-owned message history against a
+    target rather than the single system+user pair `generate` builds."""
+
+    async def test_sends_the_message_list_unmodified(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: Dict[str, Any] = {}
+
+        async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
+            captured.update(kwargs)
+            return _fake_response("multi-turn reply")
+
+        monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+        target = LiteLLMTarget(_target_config())
+        messages = [
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "reply 1"},
+            {"role": "user", "content": "turn 2"},
+        ]
+        response = await target.generate_conversation(messages)
+
+        assert captured["messages"] == messages
+        assert isinstance(response, TargetResponse)
+        assert response.content == "multi-turn reply"
+
+    async def test_does_not_inject_a_system_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: Dict[str, Any] = {}
+
+        async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
+            captured.update(kwargs)
+            return _fake_response()
+
+        monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+        # Even with a configured system_prompt, generate_conversation sends
+        # exactly the caller-supplied messages -- the multi-turn engine
+        # owns framing decisions, not the target adapter.
+        target = LiteLLMTarget(_target_config(system_prompt="Should not appear"))
+        messages = [{"role": "user", "content": "hi"}]
+        await target.generate_conversation(messages)
+
+        assert captured["messages"] == messages
+
+    async def test_respects_the_same_rate_limiter_and_semaphore_as_generate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        call_count = 0
+
+        async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
+            nonlocal call_count
+            call_count += 1
+            return _fake_response()
+
+        monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+        target = LiteLLMTarget(_target_config(rate_limit=RateLimitConfig(requests_per_second=1000, burst=2)))
+        assert target._semaphore._value == 2  # same semaphore generate() uses
+
+        await target.generate_conversation([{"role": "user", "content": "x"}])
+        assert call_count == 1
