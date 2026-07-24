@@ -92,7 +92,7 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `strategy` | string | required | Must match a `StrategyConfig.id`. |
 | `seed_prompt` | string | required | Initial prompt for the strategy. |
 | `owasp_category` | string | optional | e.g. `LLM06_SENSITIVE_INFO_DISCLOSURE`. |
-| `assertions` | list of `AssertionConfig` | `[]` | Checks run against the response (Phase 3+). |
+| `assertions` | list of `AssertionConfig` | `[]` | Checks run against the response. The `cyberjection.evaluators` cascade (Phase 3) implements the evaluation tiers this config describes; wiring `AssertionConfig` fields directly into a `CascadeEvaluator` call is orchestrator work reserved for a later phase. |
 | `metadata` | dict | `{}` | Free-form key/value pairs. |
 
 ## Mutators
@@ -140,7 +140,38 @@ applied to the framed prompt before dispatch.
 `ExecutionContext(test_id, target_id, owasp_category="LLM01_PROMPT_INJECTION",
 max_cost_limit=5.0)` carries the per-test metadata a strategy needs;
 `SingleTurnResult` is the standardized output every strategy returns,
-ready for the evaluation cascade in Phase 3.
+ready for the evaluation cascade.
+
+## Evaluators
+
+`cyberjection.evaluators` judges a `(prompt_sent, response_text)` pair and
+returns an `EvaluationOutcome`:
+
+```python
+from cyberjection.evaluators import CascadeEvaluator
+
+cascade = CascadeEvaluator()
+outcome = await cascade.evaluate(result.original_prompt, result.target_response)
+print(outcome.verdict, outcome.confidence, outcome.reason)
+```
+
+`EvaluationOutcome` fields: `verdict` (`PASS` / `FAIL` / `UNCERTAIN`),
+`confidence` (`0.0-1.0`), `judge_tier_used` (`1-3`), `reason`,
+`owasp_category` (optional), `raw_response` (optional, populated for Tier 3).
+
+| Tier | Class | Constructor options | Notes |
+|---|---|---|---|
+| 1 | `RegexEvaluator` | `custom_refusal_patterns`, `custom_secret_regexes`, `pattern_dir` | Zero-cost, sub-millisecond for typical response sizes. Defaults load from `cyberjection/evaluators/regexes/*.txt`; pass explicit lists to override rather than editing the packaged files. |
+| 2 | `LocalONNXGuardEvaluator` | `model_path`, `confidence_threshold` (default `0.90`), `classifier_fn`, `simulated_latency_seconds` | Falls back to a deterministic mock classifier if `onnxruntime` or `model_path` isn't available -- see [Tier 2 without a real model](ARCHITECTURE.md#tier-2-without-a-real-model). |
+| 3 | `LLMJudgeEvaluator` | `judge_model` (default `"openai/gpt-4o"`), `rubric`, `max_retries` (default `1`), `backoff_base_seconds` | Calls `litellm.acompletion` directly with `response_format={"type": "json_object"}`, parsed into `StructuredJudgeResponse`. A rubric string, if given, is appended to the judge system prompt for zero-shot policy customization. |
+
+`CascadeEvaluator(tier1=None, tier2=None, tier3=None,
+tier2_confidence_threshold=0.90)` chains all three; pass explicit tier
+instances to override any of them (e.g. a custom `judge_model`, or a
+`RegexEvaluator` with an organization-specific secret pattern list). Every
+evaluator's `.evaluate()` and the cascade's own `.evaluate()` are safe to
+call concurrently on a shared instance -- no mutable state is held on
+`self` during evaluation.
 
 ## Full example
 

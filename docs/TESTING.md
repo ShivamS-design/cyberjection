@@ -5,7 +5,7 @@
 ```bash
 pip install -e ".[dev]"
 pytest tests/unit/ -v
-mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/
+mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/
 pytest tests/unit/ --cov=cyberjection --cov-report=term-missing
 ```
 
@@ -13,6 +13,12 @@ To run only the Phase 2 suite:
 
 ```bash
 pytest tests/unit/test_mutators.py tests/unit/test_mutator_pipeline.py tests/unit/test_single_turn_attacks.py -v
+```
+
+To run only the Phase 3 suite:
+
+```bash
+pytest tests/unit/test_regex_evaluator.py tests/unit/test_onnx_evaluator.py tests/unit/test_llm_judge.py tests/unit/test_cascade_escalation.py -v
 ```
 
 ## Layout
@@ -25,6 +31,10 @@ pytest tests/unit/test_mutators.py tests/unit/test_mutator_pipeline.py tests/uni
 | `tests/unit/test_mutators.py` | Every concrete mutator's transformation logic, seeded reproducibility of the randomized mutators, and the alias registry (registration, collision handling, unknown-alias lookup). |
 | `tests/unit/test_mutator_pipeline.py` | `MutatorPipeline` chaining order, empty-pipeline passthrough, and that reordering mutators changes the output. |
 | `tests/unit/test_single_turn_attacks.py` | `DirectPromptInjectionStrategy`, `JailbreakStrategy`, and `SystemPromptExtractionStrategy` executed against a mocked `LiteLLMTarget`: framing, mutation-pipeline application, and `SingleTurnResult` population. |
+| `tests/unit/test_regex_evaluator.py` | The Aho-Corasick automaton (a textbook overlapping-match case and a brute-force cross-check against naive substring search over randomized text) plus `RegexEvaluator`: refusal-phrase and secret/canary detection, custom pattern overrides, and instance isolation. |
+| `tests/unit/test_onnx_evaluator.py` | `LocalONNXGuardEvaluator`: threshold handling, the mock classifier's short-circuit and escalation paths, `classifier_fn` injection, and graceful fallback when `onnxruntime`/a model file isn't available. |
+| `tests/unit/test_llm_judge.py` | `LLMJudgeEvaluator`: structured JSON parsing, rubric injection, and retry-then-`UNCERTAIN` behavior on malformed JSON, empty responses, and transport errors. |
+| `tests/unit/test_cascade_escalation.py` | `CascadeEvaluator`: short-circuiting at each tier, zero-external-call verification on Tier 1 matches, full three-tier fallback, and correctness under concurrent `evaluate()` calls on a shared instance. |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions
@@ -81,3 +91,23 @@ pytest tests/unit/test_mutators.py tests/unit/test_mutator_pipeline.py tests/uni
 2. Add a case to `tests/unit/test_single_turn_attacks.py` that mocks
    `litellm.acompletion` and asserts on both the framed/mutated prompt sent
    to the target and the populated `SingleTurnResult` fields.
+
+## Adding a new evaluator tier or pattern
+
+1. Subclass `BaseEvaluator` in a new module under `cyberjection/evaluators/`
+   and implement `async evaluate(self, prompt_sent, response_text) ->
+   EvaluationOutcome`. Return `Verdict.UNCERTAIN` for "I can't tell" rather
+   than guessing -- that's the signal the cascade escalates on.
+2. If the tier holds no state that would race under concurrent
+   `evaluate()` calls on a shared instance, don't add any (see
+   `CascadeEvaluator`, which derives its telemetry from the returned
+   outcome instead of instance attributes for exactly this reason).
+3. To add a new Tier 1 pattern, prefer editing
+   `cyberjection/evaluators/regexes/refusal_patterns.txt` (literal
+   substrings) or `secrets.txt` (regexes) over hardcoding in `regex.py`,
+   and add a case to `tests/unit/test_regex_evaluator.py`. Check any new
+   regex for catastrophic-backtracking risk (no nested unbounded
+   quantifiers) since Tier 1 is meant to stay sub-millisecond.
+4. Add a case to the relevant test file, and a cascade-level case to
+   `tests/unit/test_cascade_escalation.py` if the change affects
+   escalation behavior (e.g. a new short-circuit condition).

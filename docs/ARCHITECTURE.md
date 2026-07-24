@@ -91,9 +91,9 @@ it's backing off from a rate limit.
 
 ## Phase 2: Mutation Engine & Single-Turn Attack Generators
 
-Builds the offensive payload generation core on top of the Phase 1 target
-gateway: a chainable mutation pipeline, a dynamic mutator registry, and the
-first three single-turn attack strategies.
+Covers the offensive payload generation core built on top of the Phase 1
+target gateway: a chainable mutation pipeline, a dynamic mutator registry,
+and the first three single-turn attack strategies.
 
 | Module | Responsibility |
 |---|---|
@@ -136,13 +136,67 @@ built in Phase 1, every strategy execution inherits that target's
 token-bucket rate limiting, concurrency cap, and retry/backoff behavior
 with no additional wiring.
 
+## Phase 3: 3-Tier Cascade Evaluation Pipeline
+
+Builds the cost-optimized safety evaluation engine that judges target
+responses. Rather than sending every response to an expensive LLM judge,
+three tiers of increasing cost and capability are chained, escalating only
+when a cheaper tier can't resolve a confident verdict.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/evaluators/base.py` | `Verdict` enum (`PASS`/`FAIL`/`UNCERTAIN`), `EvaluationOutcome`, and the `BaseEvaluator` abstract interface every tier implements. |
+| `cyberjection/evaluators/ahocorasick.py` | Pure-Python Aho-Corasick automaton: multi-pattern substring matching in one pass over the text, regardless of how many phrases are registered. |
+| `cyberjection/evaluators/regex.py` | `RegexEvaluator` (Tier 1): Aho-Corasick-matched refusal phrases plus compiled regexes for secrets/canaries (AWS keys, JWTs, private key headers, DB connection strings). Curated pattern lists live in `cyberjection/evaluators/regexes/`. |
+| `cyberjection/evaluators/llamaguard.py` | `LocalONNXGuardEvaluator` (Tier 2): local safety classifier. Runs a real ONNX session when `onnxruntime` and a model are available, otherwise a deterministic mock classifier so the tier -- and the cascade's escalation path -- is fully testable without a model file. |
+| `cyberjection/evaluators/llmjudge.py` | `LLMJudgeEvaluator` (Tier 3): structured-JSON LLM-as-a-judge via `litellm.acompletion`, with a customizable grading rubric and retry/backoff on transient failures. |
+| `cyberjection/evaluators/cascade.py` | `CascadeEvaluator`: chains Tier 1 -> Tier 2 -> Tier 3, short-circuiting on the first non-`UNCERTAIN` verdict. `tiers_invoked_for(outcome)` derives which tiers ran from the returned outcome alone. |
+
+### Cascade escalation and cost model
+
+Each tier returns the same `EvaluationOutcome` shape. The orchestrator
+calls Tier 1 first; if it returns anything other than `UNCERTAIN` (a
+matched refusal phrase or a leaked secret), that's the final verdict and
+neither Tier 2 nor Tier 3 runs. Tier 2 (a local classifier, still $0.00 per
+call) only escalates to Tier 3 when its confidence is below
+`confidence_threshold` (default `0.90`). Tier 3, the only tier that makes
+an external API call, is reached only for genuinely ambiguous responses.
+
+`CascadeEvaluator` holds no mutable state on `self` during `evaluate()` --
+which tiers ran for a given call is fully derivable from the returned
+`judge_tier_used` field via `tiers_invoked_for()` -- so a single instance
+is safe to share and call concurrently across many in-flight campaign
+tests, the same way a `LiteLLMTarget` is shared across concurrent attack
+executions.
+
+Tier 1 costs sub-millisecond time for typical chat-turn-sized responses
+(measured well under 1ms for responses up to ~2KB; cost scales linearly
+with response length for longer text, since it's a single linear pass with
+no catastrophic-backtracking-prone patterns). Tier 2's local classifier
+adds 5-20ms with no network call. Only Tier 3 carries real per-call cost
+and 500-2000ms latency, which is what the cascade's escalation policy is
+designed to minimize exposure to.
+
+### Tier 2 without a real model
+
+`LocalONNXGuardEvaluator` is meant to wrap a quantized Llama Guard 3 ONNX
+export via `onnxruntime.InferenceSession`, but shipping or requiring a
+multi-hundred-megabyte model file isn't practical for every install or
+test environment. If `model_path` is omitted, or `onnxruntime` isn't
+installed, or the model fails to load, the evaluator falls back to a
+deterministic mock classifier rather than raising -- so the cascade's
+Tier 2 short-circuit and Tier 2-to-3 escalation paths are both exercisable
+in any environment. Real inference (or a custom mock) can be supplied via
+the `classifier_fn` constructor argument, which is called as
+`classifier_fn(prompt_sent, response_text) -> (is_unsafe, confidence)`.
+
 ## Roadmap
 
 | Phase | Scope |
 |---|---|
 | 1 | Core async architecture, declarative configuration, target abstraction gateway |
-| 2 (current) | Mutation engine (Base64, Homoglyph, Typoglycemia, Unicode zero-width, ROT13/Caesar) & single-turn attack generators (direct injection, jailbreak/roleplay, system prompt extraction) |
-| 3 | Three-tier cascade evaluation pipeline (regex -> local ONNX -> LLM judge) |
+| 2 | Mutation engine (Base64, Homoglyph, Typoglycemia, Unicode zero-width, ROT13/Caesar) & single-turn attack generators (direct injection, jailbreak/roleplay, system prompt extraction) |
+| 3 (current) | Three-tier cascade evaluation pipeline (regex -> local ONNX -> LLM judge) |
 | 4 | Persistence layer, SQLAlchemy database models, campaign resumability |
 | 5 | Stateful multi-turn adaptive attack engine (Crescendo, PAIR, TAP) |
 | 6 | Command-line interface (Typer + Rich) |
@@ -176,4 +230,6 @@ campaigns (id, name, status, cost, started_at, finished_at)
 
 For air-gapped deployments, Tier 1 (regex) and Tier 2 (local ONNX)
 evaluation, plus a local Ollama or vLLM target, allow fully offline
-operation once Phases 2-3 land.
+operation: skip `LLMJudgeEvaluator` (or set `confidence_threshold` low
+enough on Tier 2 that Tier 3 is never reached) to keep every evaluation
+on-box.
