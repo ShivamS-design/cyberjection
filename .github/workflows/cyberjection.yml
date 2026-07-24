@@ -1,4 +1,5 @@
-# Reusable CI/CD security evaluation gate (Phase 6, Task 6.4).
+# Reusable CI/CD security evaluation gate (Phase 6, Task 6.4; Phase 8 adds
+# the standing hardening-gate job).
 #
 # The Phase 6 design spec's own workflow sketch installs dependencies via
 # `pip install poetry && poetry install` and invokes `poetry run cyberjection
@@ -62,3 +63,40 @@ jobs:
           path: |
             results.sarif
             results.json
+
+  hardening-gate:
+    # Phase 8: dependency vulnerability + hardcoded-secret gate. Runs as its
+    # own job (not appended to security-eval) so a hardening finding is
+    # reported distinctly from an evaluation quality-gate failure in the
+    # GitHub Actions UI, and so the job list mirrors the two independent
+    # `cyberjection audit --deps` / `--secrets` checks a maintainer can also
+    # run locally.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (including the security extra)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,security]"
+
+      - name: Run dependency + secret audit
+        run: |
+          cyberjection audit \
+            --deps \
+            --secrets \
+            --fail-on-unavailable \
+            --report hardening-report.md
+
+      - name: Upload hardening report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cyberjection-hardening-report
+          path: hardening-report.md
