@@ -15,12 +15,13 @@ Full documentation lives in [`docs/`](docs/):
 
 ## Status
 
-Phases 1-6 of the project roadmap are implemented: **Core Async
+Phases 1-7 of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
 Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
-Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, and **CI/CD
-Pipeline Integration, CLI Harness & Enterprise Reporting**. See
+Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, **CI/CD
+Pipeline Integration, CLI Harness & Enterprise Reporting**, and
+**Distributed Worker Architecture, Task Queues & Rate Limiting Engine**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
 plan and what ships in each stage.
 
@@ -136,6 +137,23 @@ plan and what ships in each stage.
   and GitLab CI template (`.gitlab-ci.yml`) running the CLI as a
   pull-request security gate and uploading the SARIF report as a build
   artifact.
+
+### Phase 7: distributed worker architecture, task queues & rate limiting
+
+- `DistributedRateLimiter`: a Redis-backed token bucket enforcing both
+  requests-per-minute and tokens-per-minute limits per target provider
+  across an entire worker cluster (not just one process), checked and
+  debited atomically in a single Redis Lua script so a request is never
+  partially admitted.
+- Celery task queue (`celery_app.py` + `tasks.py`): `execute_eval_turn_task`
+  distributes evaluation turns across a horizontal worker pool, acquiring
+  a cluster-wide rate-limit token before each call, retrying transient
+  failures with exponential backoff and jitter, and routing exhausted
+  failures to a durable dead-letter queue instead of vanishing silently.
+- `DistributedClusterCoordinator`: Redis Pub/Sub broadcast/listen for
+  cluster-wide early-termination signals, wired directly to the Phase 3
+  `Verdict` type -- a `Verdict.FAIL` can abort in-flight work on every
+  worker node, not just the one that produced it.
 
 ## Installation
 
@@ -290,6 +308,7 @@ cyberjection/
 │   │                    # cascade.py, regexes/*.txt
 │   ├── persistence/     # models.py, sqlite.py, repository.py, resumability.py
 │   ├── reporting/       # models.py, sarif.py, exporters.py, quality_gate.py
+│   ├── distributed/     # celery_app.py, rate_limiter.py, coordinator.py, retry.py, tasks.py
 │   └── utils/           # exceptions.py, context.py
 ├── alembic/
 │   ├── env.py

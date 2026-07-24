@@ -2,6 +2,160 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.7.0] - Phase 7: Distributed Worker Architecture, Task Queues & Rate Limiting Engine
+
+### Added
+
+- `cyberjection/distributed/celery_app.py`: the shared `celery_app` Celery
+  application, configured with a Redis broker/result backend, JSON
+  serialization, late task acknowledgement, and a bounded worker prefetch
+  multiplier so a long-running, rate-limited task can't starve other
+  workers by hoarding a deep local queue.
+- `cyberjection/distributed/rate_limiter.py`: `DistributedRateLimiter`, an
+  atomic Redis-backed rate limiter enforcing both requests-per-minute
+  (RPM) *and* tokens-per-minute (TPM) per target provider, cluster-wide.
+  Both buckets are checked and debited in a single atomic Lua script
+  (`DUAL_TOKEN_BUCKET_LUA`) so a request is never partially admitted.
+  `evaluate_dual_bucket()` is a pure-Python function documented as a
+  line-for-line mirror of that script, kept separately hard-testable.
+- `cyberjection/distributed/coordinator.py`: `DistributedClusterCoordinator`,
+  broadcasting and listening for cluster-wide abort signals over Redis
+  Pub/Sub. `broadcast_if_failing()` wires the coordinator directly to
+  `cyberjection.evaluators.base.Verdict`, broadcasting only on `Verdict.FAIL`.
+- `cyberjection/distributed/retry.py`: `compute_backoff_delay()` (pure
+  exponential backoff with jitter, `T_wait = base * 2^retry + jitter`) and
+  `push_to_dead_letter_queue()` / `build_dead_letter_payload()` for routing
+  permanently-failed tasks to a durable Redis list.
+- `cyberjection/distributed/tasks.py`: `execute_eval_turn_task`, the Celery
+  task wrapping a single evaluation turn -- acquires a rate-limit token
+  before doing any work, retries transient failures with exponential
+  backoff, and routes exhausted-retry failures to the dead-letter queue.
+- Unit test suite: `test_rate_limiter.py`, `test_retry.py`,
+  `test_coordinator.py`, `test_distributed_tasks.py` -- including a
+  50-way concurrent `acquire()` race against a 10-unit bucket asserting
+  exactly 10 succeed, the atomicity claim exercised directly rather than
+  assumed.
+- `redis>=5.0` and `celery>=5.4` added to `pyproject.toml` dependencies.
+
+### Fixed
+
+- The Phase 7 design spec's own `DistributedRateLimiter` sketch accepted a
+  `max_tpm` constructor argument but never used it anywhere in the class
+  body -- `acquire()` only ever checked the RPM bucket, so a caller could
+  exceed a provider's tokens-per-minute cap without the limiter ever
+  noticing, despite Task 7.2's own description promising both. Implemented
+  a real second (TPM) bucket, checked and debited atomically alongside RPM
+  in one Lua script call so neither bucket is ever partially consumed.
+- The spec's `acquire()` sketch loops `while True: ... await asyncio.sleep(...)`
+  with no check that the requested amount can ever fit in the bucket. A
+  request for more units than the bucket's own capacity (e.g. a
+  misconfigured per-call token estimate exceeding the provider's
+  `max_tpm`) can never succeed no matter how long the caller waits, since
+  a bucket's level is capped at its max -- that sketch would block
+  forever. Added an immediate `RateLimitCapacityExceededError` guard for
+  exactly this case.
+- Task 7.1 explicitly directs creating a separate `celery_app.py` for "the
+  central Celery application," but the spec's own Artifact 2 code sketch
+  defines `celery_app = Celery(...)` inline inside `tasks.py` instead --
+  workable for a single task module, but not once a second module or the
+  `celery -A ... worker` CLI invocation needs the same app instance.
+  Resolved in favor of Task 7.1's explicit file layout: `celery_app.py`
+  owns the app and its configuration; `tasks.py` imports the shared
+  instance.
+- The spec's `execute_eval_turn_task` sketch constructed a brand new
+  `DistributedRateLimiter` (and therefore a new Redis connection, plus a
+  redundant `SCRIPT LOAD` re-upload) on every single task invocation.
+  Worker processes are long-lived, so the limiter is now cached per
+  `(redis_url, provider_id, max_rpm, max_tpm)` and reused across every
+  task a given worker process executes.
+- The spec's `coordinator.py` sketch's `listen_for_aborts` broke out of
+  the Pub/Sub listen loop on the first abort message without
+  unsubscribing or closing the pubsub connection, leaking a subscription
+  per listener. Wrapped in `try`/`finally` so the connection is always
+  cleaned up, including when the loop exits without ever seeing a message.
+- The spec's Definition of Done claims "Fault Recovery Tested: ...
+  failing items to the dead-letter queue," but neither the spec's task
+  breakdown (Task 7.5) nor its own code artifacts actually implement any
+  dead-letter handling -- `execute_eval_turn_task`'s sketch calls
+  `self.retry()` and stops there. Implemented the missing piece:
+  `retry.py`'s `push_to_dead_letter_queue()`, invoked from `tasks.py` when
+  `self.retry()` itself raises `MaxRetriesExceededError`.
+- The spec's own verification commands (`poetry run pytest ...`,
+  `poetry run celery ...`) assume Poetry, which this project has never
+  used -- `pyproject.toml` has used a `hatchling` build backend with a
+  plain `pip install -e ".[dev]"` flow since Phase 1 (also corrected in
+  Phase 6's CI workflow). Documented the equivalent `pip`-based commands
+  instead.
+
+### Known limitations
+
+- `cyberjection/distributed/` is not wired into the single-node
+  orchestrator from earlier phases -- there is no code path yet that
+  decides whether a campaign runs locally or dispatches to the
+  distributed queue. This mirrors how the Phase 4 persistence layer
+  landed standalone before Phase 5 wired resumability into anything;
+  that integration is left for a later phase.
+- `DistributedRateLimiter.acquire()`'s `token_cost` parameter is a
+  caller-supplied *pre-flight estimate* of prompt+completion tokens, not
+  a value reconciled against the real usage a provider reports after a
+  call completes -- exact per-call token cost usually isn't known until
+  the response arrives. Reconciling the estimate against real usage is a
+  coordination concern for whichever later phase wires this limiter into
+  `cyberjection.providers.litellm_provider.LiteLLMTarget`.
+- The dead-letter queue is a single Redis list shared by every
+  provider/target on a given Redis instance rather than partitioned per
+  target -- intentional (one place to look for every cluster-wide
+  failure), but means a very high-failure-rate provider can dominate the
+  queue's contents.
+- `execute_eval_turn_task`'s body is a scaffolded evaluation-turn
+  placeholder (acquires a rate-limit token, then a no-op await stands in
+  for the real provider call), consistent with the Phase 7 spec's own
+  "mock API execution bridge" scope -- there is no live campaign/target
+  context available from a bare Celery task signature to make a real
+  provider call with yet.
+
+### Offline test harness changes
+
+Hard-testing this phase's core claims -- atomic Redis-backed rate
+limiting and Celery task retry/dead-letter behavior -- required more than
+the usual offline shims, since neither `redis`, `celery`, a Redis server,
+nor a Lua interpreter is available in this sandbox (confirmed: `pip
+install redis` fails with the same proxy-403 error every previous
+phase's dependency installs have hit).
+
+- Added a functional in-memory `redis.asyncio` double
+  (`/tmp/_shims/redis/asyncio.py`, environment-local, not part of the
+  shipped package) implementing hash, list, and Pub/Sub commands plus
+  `SCRIPT LOAD`/`EVALSHA`. Because no Lua interpreter is available to
+  execute `DUAL_TOKEN_BUCKET_LUA` itself, `EVALSHA` recognizes that
+  specific script (by a marker comment in its source) and dispatches to
+  `evaluate_dual_bucket()` -- the documented pure-Python mirror of the
+  same algorithm -- executed under an `asyncio.Lock`, reproducing Redis's
+  single-threaded atomicity guarantee closely enough that a genuine
+  50-way concurrency race test against it either passes or fails
+  meaningfully, rather than trivially passing because nothing was
+  actually contending.
+- Added a functional `celery` double (`/tmp/_shims/celery/`) that runs
+  tasks eagerly in-process (there's no broker to dispatch to), but
+  otherwise exercises the real `Task.retry()` / `MaxRetriesExceededError`
+  control flow: a bound task's `self.retry()` raises `Retry` while budget
+  remains and `MaxRetriesExceededError` once exhausted, exactly as real
+  Celery's own `Task.retry()` does, so `tasks.py`'s own try/except around
+  `self.retry()` for dead-letter routing is exercised for real rather
+  than mocked away.
+- This is a heavier-weight version of the strategy Phase 6 used for
+  `typer`/`rich` (build a genuine shim on top of whatever *is* available)
+  rather than Phase 4's for SQLAlchemy (declare the dependency, self-skip
+  the tests offline via `pytest.importorskip`) -- chosen because Phase
+  7's core deliverables are specifically about concurrency/atomicity
+  behavior that a self-skipped test suite would never actually exercise.
+  In a real deployment with `redis`/`celery` installed and a reachable
+  Redis server (per the Definition of Done's own `docker run
+  redis:alpine` prerequisite), the same test files run unmodified against
+  the genuine packages -- nothing in `tests/unit/test_rate_limiter.py`,
+  `test_coordinator.py`, or `test_distributed_tasks.py` depends on shim
+  internals, only on the documented `redis.asyncio`/`celery` surface.
+
 ## [0.6.0] - Phase 6: CI/CD Pipeline Integration, CLI Harness & Enterprise Reporting
 
 ### Added
