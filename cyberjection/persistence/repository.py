@@ -60,6 +60,17 @@ class CampaignRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def list_recent_campaigns(self, limit: int = 10) -> List[CampaignModel]:
+        """Newest-first campaign listing for the Phase 6 CLI's `inspect`
+        command -- "inspecting persistent scan histories" (Task 6.1) needs
+        a way to enumerate campaigns at all, which nothing before Phase 6
+        required: every prior consumer of this repository already knew
+        the specific `campaign_id` it wanted."""
+
+        stmt = select(CampaignModel).order_by(CampaignModel.started_at.desc()).limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def update_campaign_status(
         self, campaign_id: str, status: str, *, total_cost: Optional[float] = None
     ) -> None:
