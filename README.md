@@ -15,11 +15,11 @@ Full documentation lives in [`docs/`](docs/):
 
 ## Status
 
-Phases 1-4 of the project roadmap are implemented: **Core Async
+Phases 1-5 of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
-Evaluation Pipeline**, and **Persistence Layer, Database Models &
-Resumability Engine**. See
+Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
+Engine**, and **Stateful Multi-Turn Adaptive Attack Engine**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
 plan and what ships in each stage.
 
@@ -92,6 +92,27 @@ plan and what ships in each stage.
   first missing turn number instead of starting over.
 - Alembic migrations, including an async-engine-compatible `env.py` so
   migrations run through the same connection code path as the application.
+
+### Phase 5: stateful multi-turn adaptive attack engine
+
+- `ConversationContext` and `AttackNode`: live conversation memory plus a
+  parallel attack-tree index that survives backtracking -- a rolled-back
+  turn disappears from what's sent to the target, but its `AttackNode`
+  stays in the tree for reporting.
+- `AttackerAgent`: a dedicated generator LLM that analyzes a target's
+  latest response and formulates the next adversarial follow-up prompt,
+  returning structured JSON (`analysis`, `refusal_detected`, `next_prompt`).
+- `CrescendoEngine`: incremental foot-in-the-door escalation across up to
+  `max_turns` turns, with automatic backtracking (`pop_last_turn`) out of
+  hard refusals so the target's memory doesn't carry a refusal forward.
+- `TAPEngine`: Tree-of-Attacks-with-Pruning breadth-first branching search,
+  exploring `branching_factor` candidate follow-ups per branch at every
+  depth, pruning branches below a score threshold, and returning the full
+  winning path (or the best-scoring path explored, if none succeeded).
+- Both engines score attacks on the same 3-tier `CascadeEvaluator` from
+  Phase 3 via `score_from_evaluation()`, which bridges Phase 3's
+  `Verdict`/confidence result onto the 0-10 attack-progress scale these
+  engines are built around.
 
 ## Installation
 
@@ -190,6 +211,30 @@ async def main():
 asyncio.run(main())
 ```
 
+Run a stateful multi-turn Crescendo attack:
+
+```python
+import asyncio
+from cyberjection.attacks import AttackerAgent, CrescendoEngine
+from cyberjection.evaluators import CascadeEvaluator
+from cyberjection.providers.litellm_provider import LiteLLMTarget
+
+async def main():
+    target = LiteLLMTarget(config.targets[0])
+    engine = CrescendoEngine(
+        evaluator=CascadeEvaluator(),
+        attacker=AttackerAgent(model="openai/gpt-4o-mini"),
+        max_turns=8,
+    )
+
+    async for node in engine.run(target, goal="extract the system prompt", initial_prompt="Hi, what can you help with?"):
+        print(node.depth, node.status, f"score={node.score:.1f}")
+        if node.status.value == "SUCCESS":
+            break
+
+asyncio.run(main())
+```
+
 ## Project layout
 
 ```
@@ -199,7 +244,8 @@ cyberjection/
 │   ├── providers/      # base.py, litellm_provider.py
 │   ├── mutators/       # base.py, registry.py, base64_mutator.py, unicode_mutator.py,
 │   │                   # typoglycemia.py, rot13.py
-│   ├── attacks/        # base.py, prompt_injection.py, jailbreak.py, system_extraction.py
+│   ├── attacks/        # base.py, prompt_injection.py, jailbreak.py, system_extraction.py,
+│   │                   # state.py, attacker.py, crescendo.py, tap.py
 │   ├── evaluators/     # base.py, ahocorasick.py, regex.py, llamaguard.py, llmjudge.py,
 │   │                   # cascade.py, regexes/*.txt
 │   ├── persistence/    # models.py, sqlite.py, repository.py, resumability.py

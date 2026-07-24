@@ -2,6 +2,108 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - Phase 5: Stateful Multi-Turn Adaptive Attack Engine
+
+### Added
+
+- `cyberjection/attacks/state.py`: `TurnStatus` (`PROGRESSING`/`REFUSED`/
+  `SUCCESS`/`BACKTRACK`), `AttackNode` (a single conversational state node,
+  0-10 attack-progress `score`, `parent_id`-linked), and
+  `ConversationContext` -- live conversation memory (`history`) plus a
+  parallel attack-tree node index (`nodes`) that survives backtracking even
+  after `history` forgets a rolled-back turn. `path_to()` reconstructs any
+  node's full root-to-leaf trajectory from `parent_id` links; `best_score()`
+  reports the highest attack-progress score reached anywhere in the tree.
+- `score_from_evaluation()`: bridges Phase 3's `EvaluationOutcome`
+  (`Verdict` + 0.0-1.0 confidence) onto the 0-10 attack-progress score and
+  refusal flag Phase 5's engines are built around.
+- `cyberjection/attacks/attacker.py`: `AttackerAgent`, generating adaptive
+  multi-turn follow-up prompts via structured JSON output
+  (`AttackerResponse`: `analysis`, `refusal_detected`, `next_prompt`), with
+  retry/backoff on transient failures.
+- `cyberjection/attacks/crescendo.py`: `CrescendoEngine`, an incremental
+  foot-in-the-door multi-turn escalation strategy. `run()` is an async
+  generator yielding one `AttackNode` per turn, backtracking
+  (`ConversationContext.pop_last_turn`) out of turns that hit a hard
+  refusal so the target's memory doesn't carry the refusal forward.
+- `cyberjection/attacks/tap.py`: `TAPEngine`, a Tree-of-Attacks-with-Pruning
+  breadth-first branching search. Expands every surviving branch at each
+  depth level in parallel, prunes branches scoring below a threshold, and
+  returns the full winning path -- or, if nothing reached the success
+  threshold, the best-scoring path actually explored.
+- `LiteLLMTarget.generate_conversation()`
+  (`cyberjection/providers/litellm_provider.py`): sends a caller-owned,
+  growing message history to a target as-is, reusing the exact same
+  target-scoped rate limiting and retry/backoff as `generate()`, so
+  multi-turn attack traffic is governed by the same policy as single-turn
+  traffic against the same target.
+- `AttackerGenerationError` (`cyberjection/utils/exceptions.py`): raised
+  when the attacker agent can't produce a next payload after exhausting
+  retries. Unlike the Tier 3 judge's `Verdict.UNCERTAIN` fallback, there's
+  no safe placeholder next-prompt value, so a multi-turn engine aborts that
+  attack trajectory instead of sending a fabricated prompt.
+- Unit test suite: `test_attack_state.py`, `test_attacker_agent.py`,
+  `test_crescendo_engine.py`, `test_tap_pruning.py`, plus three new cases
+  in `test_litellm_provider.py` covering `generate_conversation` directly.
+
+### Fixed
+
+- The Phase 5 spec's own `CrescendoEngine.run()` code yielded the same
+  `AttackNode` twice on any turn that triggered a backtrack (once inside
+  the backtrack branch, once via an unconditional `yield` immediately
+  after it). Caught with a test asserting exactly one node per turn;
+  `run()` now yields exactly once per turn attempted regardless of status.
+- The Phase 5 spec's `TAPEngine.execute_tree_search()` pseudocode had
+  `active_branches = next_generation_branches` and the search's final
+  `return` sitting one indent level too deep -- taken literally, the
+  search would terminate after a single depth level regardless of
+  `max_depth`, and `active_branches` would be reassigned mid-way through
+  processing the current depth's branches rather than after all of them
+  finished. Reimplemented as a straightforward breadth-first
+  depth-by-depth expansion; verified with a test that explores 4 full
+  depth levels under threshold settings that neither prune nor succeed.
+- The spec's `TAPEngine` and `CrescendoEngine` code assumed
+  `eval_result.score` (0-10) and `eval_result.is_refusal` (bool) directly
+  on the evaluator's return value; neither field exists on Phase 3's real
+  `EvaluationOutcome` (which has `verdict` and a 0.0-1.0 `confidence`
+  instead). Fixed by adding `score_from_evaluation()` as the one place both
+  engines convert between the two phases' score semantics, rather than
+  each engine growing its own (and inevitably diverging) conversion.
+- A first draft of `TAPEngine`'s "return the best partial path when no
+  branch succeeds" logic picked the *first* node it encountered among
+  several tied for the highest score, because `max()` keeps the first item
+  on ties and `ConversationContext.nodes` iterates in insertion order. On
+  a tree where every branch scored identically, this returned a
+  barely-explored, shallow path instead of the branch that actually made
+  it furthest. Caught by a test with 4 depth levels scoring identically;
+  fixed by breaking ties on `depth` (deeper wins) in addition to `score`.
+- The Phase 5 spec's own `AttackerAgent` design referenced
+  `cyberjection.gateways.litellm_gateway.LiteLLMGateway`, a class that
+  doesn't exist anywhere in this codebase. `AttackerAgent` instead calls
+  `litellm.acompletion` directly with structured JSON output and
+  retry/backoff, mirroring the exact pattern `LLMJudgeEvaluator` (Phase 3)
+  already established for the same reason: attacker generation is
+  orchestration tooling, not attack traffic against a target under test.
+
+### Known limitations
+
+- Neither `CrescendoEngine` nor `TAPEngine` is wired into an orchestrator
+  loop or the Phase 4 persistence layer yet -- turns aren't automatically
+  checkpointed via `CampaignRepository`. That wiring is orchestrator work
+  reserved for a later phase, consistent with how Phase 4's repository and
+  resumability engine were shipped as a standalone, tested API first.
+- `TAPEngine`'s branch count grows as `branching_factor ** depth`; with
+  the defaults (`branching_factor=3`, `max_depth=5`) a full unpruned search
+  could reach several hundred target + attacker + evaluator calls. There's
+  no built-in cost cap yet beyond `pruning_threshold` naturally trimming
+  unproductive branches -- wiring `CampaignConfig.max_cost_cap` into these
+  engines is future orchestrator work.
+- `StrategyConfig.max_turns` (Phase 1 schema, capped at 25) is not yet
+  automatically wired to construct a `CrescendoEngine` from campaign YAML;
+  callers construct `CrescendoEngine`/`TAPEngine` directly in Python for
+  now, the same interim state Phase 2's mutator pipeline and Phase 3's
+  cascade evaluator were shipped in before orchestrator wiring landed.
+
 ## [0.4.0] - Phase 4: Persistence Layer, Database Models & Resumability Engine
 
 ### Added
