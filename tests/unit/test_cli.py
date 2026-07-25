@@ -28,8 +28,49 @@ from cyberjection.cli.main import (  # noqa: E402
     EXIT_USAGE_ERROR,
     app,
 )
+from cyberjection.reporting.models import Finding  # noqa: E402
 
 runner = CliRunner()
+
+
+def _canned_findings():
+    # Phase 9 replaced `_execute_pipeline`'s two-hardcoded-`Finding` stub
+    # with the real orchestrator (see cyberjection/orchestrator/campaign.py),
+    # which needs a real or mocked LLM target to produce anything. This
+    # file's own docstring scopes it to the `run`/`inspect`/`export`
+    # commands' argument-parsing and exit-code behavior, not the
+    # orchestrator's attack/evaluator execution -- that's what
+    # test_orchestrator.py covers directly. These two findings reproduce
+    # the shape the old stub used to return (one finding scoring 3.4, one
+    # scoring 1.1) so `TestRunQualityGateExitCodes`/`TestRunExportFlags`'s
+    # threshold-comparison assertions keep meaning what they say.
+    return [
+        Finding(
+            rule_id="CJ-001",
+            category="prompt_injection",
+            score=3.4,
+            details="Simulated finding for CLI argument-parsing tests.",
+        ),
+        Finding(
+            rule_id="CJ-002",
+            category="jailbreak",
+            score=1.1,
+            details="Simulated finding for CLI argument-parsing tests.",
+        ),
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _stub_pipeline(monkeypatch):
+    # Isolates this file from the real orchestrator the same way
+    # `TestInspectCommand` isolates itself from a real database by mocking
+    # `_inspect_async` -- see `_canned_findings()` above for why.
+    import cyberjection.cli.main as cli_main
+
+    async def _fake_execute_pipeline(config, target, *, db_url=None, resume_campaign_id=None):
+        return _canned_findings()
+
+    monkeypatch.setattr(cli_main, "_execute_pipeline", _fake_execute_pipeline)
 
 
 @pytest.fixture(autouse=True)
@@ -190,13 +231,20 @@ class TestRunExportFlags:
         assert md_path.exists()
 
     def test_no_export_flags_writes_no_files(self, config_path, tmp_path) -> None:
-        before = set(tmp_path.iterdir())
+        # `audit.jsonl` is a real, expected side effect of every `run`
+        # invocation (the `_isolated_audit_log` fixture points
+        # `_audit_logger` at this same `tmp_path`, and `run_evaluation`
+        # unconditionally calls `_audit_logger.log(...)` several times) --
+        # not a report file this test cares about. Without excluding it,
+        # this assertion would fail on every invocation regardless of the
+        # `--sarif-out`/`--json-out`/`--markdown-out` flags under test.
+        before = {p.name for p in tmp_path.iterdir()}
         runner.invoke(
             app,
             ["run", "--config", str(config_path), "--target", "support-agent", "--threshold", "9.9"],
         )
-        after = set(tmp_path.iterdir())
-        assert before == after
+        after = {p.name for p in tmp_path.iterdir()}
+        assert after - before <= {"audit.jsonl"}
 
     def test_path_traversal_in_sarif_out_is_rejected(self, config_path, monkeypatch, tmp_path) -> None:
         # _safe_output_path() contains report paths to Path.cwd(); running
