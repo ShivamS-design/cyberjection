@@ -650,6 +650,70 @@ locally, concurrency-bounded by `max_workers` via an `asyncio.Semaphore`,
 not dispatched to Celery workers. Real distributed dispatch remains a
 documented follow-up.
 
+## Phase 10: Plugin Architecture, Web Dashboard, Container Deployment
+
+Three largely independent additions, all building on infrastructure
+earlier phases deliberately left ready for them (the presentation-layer
+diagram at the top of this document has named `apps/api (FastAPI)` and
+`apps/dashboard (React)` boxes since Phase 1; "Pluggable architecture"
+has been a listed design principle since before any registry existed to
+back it):
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/attacks/registry.py`, `cyberjection/evaluators/registry.py`, `cyberjection/reporting/registry.py` | Three new alias registries, each mirroring the Phase 2 `cyberjection.mutators.registry` pattern exactly: a short alias (`"jailbreak"`, `"regex"`, `"sarif"`) resolves to a class via `@register_*(alias)`, with the same idempotent-re-registration / collision-on-different-class rules. Built-ins self-register at import time; `cyberjection.orchestrator.campaign._build_strategy` now resolves strategies through the strategy registry instead of a hardcoded dict. |
+| `cyberjection/plugins/` | `discover_plugins()`: scans `importlib.metadata.entry_points()` across four groups (`cyberjection.mutators`/`.strategies`/`.evaluators`/`.exporters`), imports each referenced object, and registers it into the matching subsystem registry above under the entry point's own name. Best-effort by default -- one broken third-party plugin is reported, not fatal to the others. No fifth "plugin registry" exists; a plugin is routed straight into the registry a built-in of the same kind already uses. |
+| `cyberjection/api/` | `cyberjection.api.asgi`: a dependency-free ASGI 3.0 toolkit (router, request/response, lifespan handling) built on nothing but the standard library. `cyberjection.api.app`: five read-only REST endpoints over the Phase 4 persistence layer and the plugin registries. `cyberjection.api.server`: the `uvicorn`-backed entrypoint (`uvicorn` is an optional extra, not a hard dependency of the app itself). |
+| `cyberjection/cli/main.py` (`plugins`, `serve` commands) | `plugins`: lists every registered alias by group, including anything `discover_plugins()` found this run. `serve`: runs the dashboard API under `uvicorn`; reports a clear environment error (matching `inspect`'s SQLAlchemy-unavailable path) if `uvicorn` isn't installed. |
+| `apps/dashboard/` | A Vite + React + TypeScript single-page app: a campaign list, a campaign detail view (its test cases), a test detail view (full conversation transcript, metrics, findings), and a plugins page -- all talking to `cyberjection.api`'s REST endpoints via relative `/api/...` fetches. |
+| `Dockerfile`, `apps/dashboard/Dockerfile`, `docker-compose.yml` | Multi-stage container images for the API/CLI (Python) and the dashboard (Node build -> nginx serve), composed together for the single-instance deployment model `docs/DEPLOYMENT.md` describes. |
+
+### Why the API isn't built on FastAPI
+
+The architecture diagram has said `apps/api (FastAPI)` since Phase 1, but
+`cyberjection.api` is built on nothing but the standard library instead.
+Neither FastAPI nor its dependencies (Starlette, a real ASGI server) are
+guaranteed installable in every environment this project already commits
+to supporting without one -- the same offline-friendly constraint that
+led `cyberjection.cli.main` to build on `typer`/`rich` rather than a
+heavier framework. `cyberjection.api.asgi.ASGIApp` implements the ASGI
+3.0 `http`/`lifespan` protocol directly (`async def __call__(self, scope,
+receive, send)`), so it runs unmodified under any real ASGI server in
+production; `cyberjection.api.server.run_server` is the only place that
+ever imports `uvicorn`, and only when actually asked to serve traffic
+(`cyberjection serve`). The original "(FastAPI)" diagram label is kept as
+historical framing of the layer's *role* in the architecture, not a
+literal implementation dependency -- see that module's own docstring for
+the full reasoning.
+
+### No fifth registry: plugins reuse the subsystem registries
+
+A tempting alternative design would give `cyberjection.plugins` its own
+registry, separate from `cyberjection.mutators.registry` and its three
+siblings. This phase deliberately doesn't do that: `discover_plugins()`
+calls the exact same `register_mutator`/`register_strategy`/
+`register_evaluator`/`register_exporter` decorator functions a built-in
+implementation is decorated with, just invoked as plain functions at
+runtime instead of at class-definition time (`register_strategy(alias)
+(loaded_class)` rather than `@register_strategy(alias)` on the class).
+This means "is this alias valid" has exactly one source of truth per
+subsystem, regardless of whether the alias came from a built-in or a
+plugin -- there's no way for a plugin registry and a subsystem registry
+to disagree about what `"jailbreak"` resolves to, because there's only
+ever one registry that could answer the question.
+
+### The dashboard is read-only, on purpose
+
+Every `cyberjection.api.app` endpoint is a `GET`. Starting or resuming a
+campaign, or editing persisted results, both stay CLI-only
+(`cyberjection run`/`--resume`) in this phase -- the dashboard is a
+viewer for the same SQLite/PostgreSQL history `cyberjection inspect`
+already reads, not a second write path into it. Extending the API with
+write endpoints (and the authentication layer that would then become
+mandatory, not optional -- see `docs/COMPLIANCE.md`'s now-`PARTIAL`
+authentication controls) is a documented follow-up, not part of this
+phase.
+
 ## Roadmap
 
 | Phase | Scope |

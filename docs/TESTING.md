@@ -5,7 +5,7 @@
 ```bash
 pip install -e ".[dev]"
 pytest tests/unit/ -v
-mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/
+mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/ cyberjection/plugins/ cyberjection/api/
 pytest tests/unit/ --cov=cyberjection --cov-report=term-missing
 ```
 
@@ -101,6 +101,46 @@ tests run through the real strategy classes and `LiteLLMTarget` with
 `test_single_turn_attacks.py` uses, so this file also catches wiring bugs
 between the orchestrator and the real attack/target stack.
 
+To run only the Phase 10 suite:
+
+```bash
+pytest tests/unit/test_registries.py tests/unit/test_plugins.py tests/unit/test_api.py tests/unit/test_api_persistence.py -v
+
+# CLI smoke checks
+cyberjection plugins
+cyberjection serve --help
+```
+
+`test_registries.py` and `test_plugins.py` need no `pytest.importorskip`
+-- the three new subsystem registries (`cyberjection.attacks.registry`,
+`cyberjection.evaluators.registry`, `cyberjection.reporting.registry`)
+and `cyberjection.plugins.discover_plugins` are pure Python with no
+third-party dependency, and `test_plugins.py` exercises entry-point
+discovery against fake `_FakeEntryPoint` objects rather than a real
+installed distribution. `test_api.py` (the ASGI toolkit, `/api/health`,
+`/api/plugins`, and the "persistence unavailable" 503 path) also always
+runs -- `cyberjection.api.asgi`/`cyberjection.api.app` have no
+third-party dependency of their own (see that module's docstring for why
+it isn't built on FastAPI). `test_api_persistence.py` (the campaign/test
+endpoints' happy path against a real in-memory database) does
+`pytest.importorskip("sqlalchemy")`/`("aiosqlite")` at module scope and
+self-skips, same as `test_database_models.py`/`test_repository.py`.
+
+**Not verified in this sandbox:** `apps/dashboard`'s TypeScript/React
+source has no offline package registry access to install
+`npm`/`typescript`/`vite` against in the environment this project was
+hard-tested in (`npm view` returns `403 Forbidden` from the sandbox's
+network allowlist, the same constraint that blocks `pip install
+fastapi`), so the dashboard could not be `npm run build`/`tsc --noEmit`
+verified here. Its source was written and reviewed against the exact
+JSON shapes `cyberjection.api.app`'s own tests
+(`test_api.py`/`test_api_persistence.py`) assert on, and kept
+dependency-minimal (`react`, `react-dom`, `react-router-dom` only, no
+UI framework) to reduce the surface that could be wrong. Verifying it
+with a real `npm install && npm run build` in an environment with
+registry access is a recommended follow-up before a production
+deployment.
+
 ## Layout
 
 | File | Covers |
@@ -136,6 +176,10 @@ between the orchestrator and the real attack/target stack.
 | `tests/unit/test_dependency_audit.py` | `parse_pip_audit_json` against canned `pip-audit --format json` fixtures (single/multiple findings, missing fields, truncation, malformed input); `run_dependency_audit`'s real `source="unavailable"` fallback in this sandbox; `evaluate_dependency_gate`'s pass/fail decision across every `source` value and `fail_on_unavailable` setting. |
 | `tests/unit/test_compliance.py` | Structural invariants of the real `CONTROL_REGISTRY` (unique ids, evidence required for `IMPLEMENTED`, notes required for `NOT_APPLICABLE`) plus `compliance_summary`/`generate_compliance_report` against both the real registry and small synthetic ones (grouping order, missing-evidence/notes rendering, multiline-note flattening). |
 | `tests/unit/test_orchestrator.py` | `_build_cascade_evaluator`/`_build_strategy`/`_verdict_from_multi_turn` pure-function behavior; single-turn execution end-to-end against a monkeypatched `litellm.acompletion`; multi-turn dispatch/goal-resolution/turn-conversion against scripted `CrescendoEngine`/`TAPEngine` stand-ins; configuration-error and provider-failure handling (a failing test case never aborts the others); resumability's `SKIP_COMPLETE`/`RESUME`/no-manager paths (including that a `RESUME`'d test really does call the target again, as a fresh row); persistence wiring against a duck-typed fake repository; `max_concurrency` actually bounding in-flight test cases (a 12-vs-3 concurrency race, mirroring `test_rate_limiter.py`'s own atomicity test); and `execute_campaign`'s persistence-unavailable and `--resume`-without-persistence paths. |
+| `tests/unit/test_registries.py` | The three Phase 10 subsystem registries (`cyberjection.attacks.registry`, `cyberjection.evaluators.registry`, `cyberjection.reporting.registry`): built-in alias presence, correct-class resolution, unknown-alias lookup errors, non-subclass/non-`export`-attribute rejection, alias-collision-with-a-different-class rejection, and idempotent re-registration -- the same property set `test_mutators.py::TestMutatorRegistry` already covers for the Phase 2 registry these three mirror. |
+| `tests/unit/test_plugins.py` | `cyberjection.plugins.loader.discover_plugins`: successful load-and-register across all four plugin groups against fake `_FakeEntryPoint` objects, per-loaded-plugin metadata (group/alias/qualified_name/obj), non-fatal failure on a wrong-base-type plugin or a `load()` that raises (one bad plugin doesn't block the others in the same group), `strict=True` raising on first failure instead of collecting, an unknown plugin group, and `known_aliases_by_group`'s four-group shape and sorted output. |
+| `tests/unit/test_api.py` | `cyberjection.api.asgi`: `Router` path-param matching (including that a param can't cross a `/` boundary, and that a more-specific route registered first wins), `Request.query_int`'s malformed-input fallback, ASGI `lifespan` startup/shutdown handshake, unmatched-route 404, handler-exception 500, and query-string parsing. `cyberjection.api.app`: `/api/health`, `/api/plugins` (built-in aliases present, empty discovery/failures), and the `/api/campaigns*` 503 "persistence unavailable" path (via a monkeypatched `_SQLALCHEMY_AVAILABLE`). Uses a hand-rolled ASGI test client (`_call_asgi_app`) rather than `httpx`/`starlette.testclient`, neither of which is a project dependency. |
+| `tests/unit/test_api_persistence.py` | The same `/api/campaigns*` endpoints' happy path against a real in-memory database (`DatabaseManager.in_memory()`, wired into `build_app`'s `manager=` parameter): campaign listing, campaign detail with its tests, unknown-campaign 404, test detail with turns/metrics, and the "test id right, campaign id wrong" and unknown-test-id 404 cases. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise (kept in its own module, not a class inside `test_api.py`, specifically so the whole file module-skips the same way `test_database_models.py`/`test_repository.py` already do, rather than relying on a class-scoped fixture the offline test runner's fixture resolver doesn't collect). |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions
@@ -321,3 +365,42 @@ between the orchestrator and the real attack/target stack.
    whatever async work the task/signal wraps (see `_install_failing_stub`
    in `test_distributed_tasks.py`), so retry/backoff/DLQ paths can be
    exercised deterministically without waiting on real countdowns.
+
+## Adding a new dashboard API endpoint
+
+1. Add an `async def handler(request: Request) -> Response` closure
+   inside `build_app` in `cyberjection/api/app.py`, following the
+   existing handlers' shape: resolve the persistence manager via
+   `_get_manager()` and return `_unavailable()` if it's `None`, otherwise
+   open a session, query through `CampaignRepository`, and return
+   `JSONResponse(...)`.
+2. Register the route via `router.add_route("GET", "/api/your/{path}",
+   handler)` in `build_app`, before any less-specific route that could
+   also match the same path prefix (see `cyberjection.api.asgi.Router`'s
+   docstring).
+3. Add cases to `tests/unit/test_api.py` for the persistence-unavailable
+   path (no `sqlalchemy` needed) and to `tests/unit/test_api_persistence.py`
+   for the real-database happy path, following the `seeded_app` fixture
+   pattern in the latter.
+4. If the new endpoint's response shape is meant for the dashboard to
+   consume, add the matching TypeScript interface to
+   `apps/dashboard/src/types.ts` and a fetch function to
+   `apps/dashboard/src/api/client.ts`.
+
+## Adding a new plugin group
+
+Phase 10 ships exactly four plugin groups (mutators, strategies,
+evaluators, exporters) because those are the four extension points that
+already had a subsystem registry before plugins existed. Adding a fifth
+kind of pluggable thing means, in order: (1) build the subsystem registry
+for it first, mirroring `cyberjection.mutators.registry`'s
+register/get/list/idempotent-reregistration shape and its
+`_reset_registry_for_tests`/`_restore_registry_for_tests` test helpers;
+(2) add the new group name to `cyberjection.plugins.base.ALL_PLUGIN_GROUPS`
+and a registrar entry to `cyberjection.plugins.loader._REGISTRARS`; (3)
+add the group to `cyberjection.plugins.registry._ALIAS_LISTERS`; (4) add
+test coverage to `tests/unit/test_registries.py` (the new registry) and
+`tests/unit/test_plugins.py` (discovery through the new group). Do not
+introduce a plugin-specific registry that duplicates what the subsystem
+registry already tracks -- see `docs/ARCHITECTURE.md`'s Phase 10 section
+for why.

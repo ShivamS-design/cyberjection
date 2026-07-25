@@ -259,7 +259,9 @@ cyberjection export --from-json results.json --output results.sarif --format sar
 |---|---|---|
 | `run` | `--config`/`-c` (default `cyberjection.yaml`), `--target`/`-t` (required), `--threshold`, `--sarif-out`, `--json-out`, `--markdown-out`, `--db-url`, `--resume` | Loads the campaign config, resolves the target, runs the evaluation pipeline through the real Phase 9 orchestrator, applies the quality gate, and exits `0`/`1`/`2` (see below). `--threshold` overrides the campaign's `quality_gate.threshold`; omitting both falls back to `7.0`. `--db-url` points campaign persistence at a non-default database (falls back to the local SQLite results DB; ignored if `sqlalchemy`/`aiosqlite` aren't installed). `--resume <campaign-id>` continues a previously interrupted campaign (see `cyberjection inspect` for known ids) instead of starting a new one, skipping test cases already `COMPLETED`; exits `2` if the given id doesn't resolve to a known campaign. |
 | `inspect` | `--db-url`, `--limit` (default `10`) | Lists recently persisted campaigns via `CampaignRepository.list_recent_campaigns`. Requires the Phase 4 persistence layer (`sqlalchemy`, `aiosqlite`). |
-| `export` | `--from-json` (required), `--output`/`-o` (required), `--format`/`-f` (`sarif` or `markdown`, default `sarif`), `--threshold` | Re-renders a prior `run --json-out` report into another format without re-running an evaluation. |
+| `export` | `--from-json` (required), `--output`/`-o` (required), `--format`/`-f` (`sarif`, `markdown`, or any alias registered in `cyberjection.reporting.registry` -- including a Phase 10 plugin exporter, default `sarif`), `--threshold` | Re-renders a prior `run --json-out` report into another format without re-running an evaluation. |
+| `plugins` | (none) | Phase 10: discovers third-party plugins (`cyberjection.plugins.discover_plugins`) and lists every registered mutator/strategy/evaluator/exporter alias by group. A plugin that fails to load is reported, not fatal to the listing -- see [Plugin architecture](#plugin-architecture-phase-10) below. |
+| `serve` | `--host` (default `127.0.0.1`), `--port` (default `8000`), `--db-url` | Phase 10: serves the dashboard REST API (`cyberjection.api`) under `uvicorn`. Requires the optional `api` extra (`pip install cyberjection[api]`); exits `3` with a clear message if `uvicorn` isn't installed, the same as `inspect` without SQLAlchemy. |
 
 **Exit codes:** `0` quality gate passed, `1` quality gate failed (the run
 executed correctly but a finding met or exceeded the threshold), `2` a
@@ -375,6 +377,78 @@ have no environment-variable configuration -- they're called with
 explicit arguments from the CLI (`base_dir=Path.cwd()` for output paths)
 rather than tunable via environment, keeping their behavior predictable
 regardless of the calling environment's variables.
+
+## Plugin architecture (Phase 10)
+
+`cyberjection.plugins.discover_plugins()` scans `importlib.metadata`
+entry points across four groups and registers whatever it finds into the
+matching built-in registry (`cyberjection.mutators.registry`,
+`cyberjection.attacks.registry`, `cyberjection.evaluators.registry`,
+`cyberjection.reporting.registry`) -- there is no separate
+plugin-specific registry; see `docs/ARCHITECTURE.md`'s Phase 10 section
+for why. A third-party distribution advertises a plugin by adding an
+entry point to its own `pyproject.toml`:
+
+```toml
+[project.entry-points."cyberjection.mutators"]
+leetspeak = "my_package.mutators:LeetspeakMutator"
+
+[project.entry-points."cyberjection.strategies"]
+my_strategy = "my_package.attacks:MyStrategy"
+
+[project.entry-points."cyberjection.evaluators"]
+my_evaluator = "my_package.evaluators:MyEvaluator"
+
+[project.entry-points."cyberjection.exporters"]
+csv = "my_package.reporting:CSVExporter"
+```
+
+| Group | Base contract the loaded object must satisfy |
+|---|---|
+| `cyberjection.mutators` | A `cyberjection.mutators.base.BaseMutator` subclass. |
+| `cyberjection.strategies` | A `cyberjection.attacks.base.BaseStrategy` subclass. |
+| `cyberjection.evaluators` | A `cyberjection.evaluators.base.BaseEvaluator` subclass. |
+| `cyberjection.exporters` | Any class exposing a callable `export(findings, output_path, *, threshold=7.0)` -- no shared base class, since the three built-in exporters (`JSONExporter`, `MarkdownExporter`, `SARIFReporter`) never had one either. |
+
+Once installed in the same environment as Cyberjection, a plugin's alias
+works everywhere a built-in one does: `StrategyConfig.converters`/`type`
+in campaign YAML, `cyberjection export --format <alias>`, the `/api/plugins`
+dashboard endpoint. `discover_plugins()` is best-effort by default -- one
+broken plugin is reported (as a `PluginLoadError`), not fatal to loading
+the others; pass `strict=True` to instead raise on the first failure.
+
+```bash
+cyberjection plugins
+```
+
+## Dashboard API & web dashboard (Phase 10)
+
+`cyberjection.api` is a small, dependency-free ASGI application (no
+FastAPI/Starlette dependency -- see `cyberjection.api.asgi`'s module
+docstring) exposing five read-only REST endpoints over the persistence
+layer and the plugin registries:
+
+| Method & path | Returns |
+|---|---|
+| `GET /api/health` | `{"status": "ok"}` -- liveness probe. |
+| `GET /api/plugins` | Every registered alias by group, plus anything discovered this request and any load failures. |
+| `GET /api/campaigns?limit=N` | Recent campaigns (default `limit=20`). |
+| `GET /api/campaigns/{campaign_id}` | One campaign plus its test summaries. |
+| `GET /api/campaigns/{campaign_id}/tests/{test_id}` | One test's full detail: seed prompt, turns, findings, metrics. |
+
+Every persistence-backed endpoint returns `503` if SQLAlchemy/aiosqlite
+aren't installed, rather than raising -- the same graceful-degradation
+contract `cyberjection inspect` uses. Serve it with:
+
+```bash
+cyberjection serve --host 0.0.0.0 --port 8000 --db-url sqlite+aiosqlite:///.cyberjection/results.db
+```
+
+`apps/dashboard/` is a Vite + React + TypeScript single-page app
+consuming this API (campaigns list, campaign detail, test transcript
+view, plugins page). See [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for how to
+build and run it, either directly (`npm run dev`/`npm run build`) or via
+the provided Docker images.
 
 ## Full example
 

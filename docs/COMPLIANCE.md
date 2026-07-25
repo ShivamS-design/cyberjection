@@ -38,8 +38,8 @@ leaving just the Markdown report body below).
 | Status | Count |
 |---|---|
 | IMPLEMENTED | 9 |
-| PARTIAL | 6 |
-| NOT_APPLICABLE | 3 |
+| PARTIAL | 8 |
+| NOT_APPLICABLE | 1 |
 | NOT_IMPLEMENTED | 0 |
 
 ## OWASP ASVS 4.0
@@ -47,15 +47,15 @@ leaving just the Markdown report body below).
 | Control | Title | Status | Evidence | Notes |
 |---|---|---|---|---|
 | ASVS-V1.1 | A verified architecture and threat model exists and is kept current | IMPLEMENTED | `docs/ARCHITECTURE.md#threat-model-summary` | Threat model table maps concrete risks to concrete mitigations, updated every phase. |
-| ASVS-V2 | Authentication controls | NOT_APPLICABLE | - | Cyberjection is a locally-run CLI/library with no network-facing authentication surface as of Phase 8. Revisit once Phase 10's web dashboard/API introduces one. |
-| ASVS-V4 | Access control | NOT_APPLICABLE | - | Single-operator CLI tool; no multi-user authorization boundary exists yet. |
+| ASVS-V2 | Authentication controls | PARTIAL | `cyberjection/api/`<br>`docker-compose.yml`<br>`docs/DEPLOYMENT.md` | Phase 10's dashboard API (cyberjection.api) introduced Cyberjection's first network-facing surface, and it deliberately implements no authentication of its own -- the 'single trusted team, one instance' deployment model documented in docs/DEPLOYMENT.md puts the operator's own network perimeter/reverse proxy in front of it instead of building a second, likely-worse auth layer inside this project. Every endpoint is also read-only (see docs/ARCHITECTURE.md's Phase 10 section), so the surface an unauthenticated caller can reach is bounded to already-completed campaign history, not campaign execution. |
+| ASVS-V4 | Access control | NOT_APPLICABLE | - | Still no multi-user authorization boundary: the CLI remains single-operator, and Phase 10's dashboard API has no user/session concept to scope access within -- see ASVS-V2's note above for why that's a deployment-perimeter decision rather than an in-app access-control gap. |
 | ASVS-V5.1 | Input validation is applied to all untrusted input | IMPLEMENTED | `cyberjection/security/input_validation.py:assert_safe_output_path`<br>`cyberjection/security/input_validation.py:assert_safe_target_url`<br>`cyberjection/security/input_validation.py:enforce_payload_size_limit`<br>`cyberjection/config/schema.py (Pydantic field validation)` | - |
 | ASVS-V5.2 | Sanitization / safe deserialization of structured input | IMPLEMENTED | `cyberjection/config/loader.py:_parse_yaml (uses yaml.safe_load, never yaml.load)` | - |
 | ASVS-V7.1 | Security-relevant events are logged with enough detail for later review | IMPLEMENTED | `cyberjection/security/audit_log.py:AuditLogger`<br>`cyberjection/cli/main.py (audit_logger.log(...) call sites)` | - |
 | ASVS-V7.4 | Log records are protected against unauthorized modification | PARTIAL | `cyberjection/security/audit_log.py:verify_chain` | Hash-chained log entries make tampering with an existing entry detectable via verify_chain(), but the log file itself has no filesystem-level write protection or off-host replication -- an attacker with delete access can still truncate and restart the chain. Full protection needs an append-only or remote log sink, which is deployment-environment-specific and out of this library's scope. |
 | ASVS-V9.1 | TLS is used for all external service communication | PARTIAL | `cyberjection/providers/litellm_provider.py (delegates HTTPS handling to litellm/httpx)` | Relies on litellm's own default HTTPS behavior; not independently verified or pinned by this codebase. |
 | ASVS-V12.1 | Path traversal is prevented on file operations driven by external input | IMPLEMENTED | `cyberjection/security/input_validation.py:assert_safe_output_path`<br>`tests/unit/test_input_validation.py` | - |
-| ASVS-V13 | API and web service security controls | NOT_APPLICABLE | - | No REST API exists yet as of Phase 8; revisit when Phase 10 ships one. |
+| ASVS-V13 | API and web service security controls | PARTIAL | `cyberjection/api/asgi.py`<br>`cyberjection/api/app.py`<br>`tests/unit/test_api.py`<br>`tests/unit/test_api_persistence.py` | The REST API Phase 10 ships is intentionally minimal and read-only (5 GET endpoints, no mutation, no request body parsing -- see cyberjection/api/asgi.py's module docstring), which removes several ASVS-V13 subcontrols by construction (no injection surface via a request body, no state-changing endpoint to authorize). It does not implement authentication, rate limiting, or CORS policy -- those are left to the deployment's own reverse proxy per docs/DEPLOYMENT.md, not implemented in-app. |
 | ASVS-V14.2 | Dependencies are tracked and checked against known vulnerabilities | IMPLEMENTED | `cyberjection/security/dependency_audit.py:run_dependency_audit`<br>`.github/workflows/cyberjection.yml` | - |
 | ASVS-V14.3 | No secrets are hardcoded in source or configuration | IMPLEMENTED | `cyberjection/security/secrets_audit.py`<br>`cyberjection/config/loader.py (${VAR} expansion keeps secrets out of YAML)`<br>`cyberjection/config/schema.py (api_key: SecretStr, never reprinted)` | - |
 
@@ -72,11 +72,20 @@ leaving just the Markdown report body below).
 
 ## Reading the PARTIAL entries
 
-Six controls are marked `PARTIAL` rather than `IMPLEMENTED`. Each one has
-real, working evidence behind it -- the gap is between what this project
-can enforce as a library/CLI and what requires deployment-environment
-configuration this codebase can't control from inside itself:
+Eight controls are marked `PARTIAL` rather than `IMPLEMENTED`. Each one
+has real, working evidence behind it -- the gap is between what this
+project can enforce as a library/CLI/API and what requires
+deployment-environment configuration this codebase can't control from
+inside itself:
 
+- **ASVS-V2 / ASVS-V13** (API authentication and web service security
+  controls): new as of Phase 10, once `cyberjection.api` gave the
+  project its first network-facing surface at all. The API is
+  intentionally read-only and minimal, but it ships with no
+  authentication, rate limiting, or CORS policy of its own -- the
+  "single trusted team, one instance" deployment model in
+  `docs/DEPLOYMENT.md` puts that responsibility on the operator's own
+  network perimeter/reverse proxy instead.
 - **ASVS-V7.4 / SOC2-CC7.2 / SOC2-CC7.3** (audit log protection and
   monitoring): the hash chain makes tampering *detectable*, not
   *impossible* -- true immutability needs an append-only filesystem or a
@@ -87,7 +96,8 @@ configuration this codebase can't control from inside itself:
   verified by this codebase.
 - **SOC2-CC6.1** (access control): credential handling (`SecretStr`) is
   solid, but there's no multi-user authorization model, because
-  Cyberjection is a single-operator CLI tool as of Phase 8.
+  Cyberjection is still a single-operator CLI/single-tenant dashboard
+  tool as of Phase 10.
 - **SOC2-CC6.8** (change control): CI-enforced secret/dependency scanning
   exists, but branch protection and code signing are GitHub/GitLab
   repository settings, not something this codebase configures for you.
