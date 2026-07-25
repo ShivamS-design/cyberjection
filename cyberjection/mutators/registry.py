@@ -46,6 +46,16 @@ def register_mutator(alias: str):
     return decorator
 
 
+def is_registered(alias: str) -> bool:
+    """True if ``alias`` resolves to a registered mutator class. Added
+    alongside the Phase 10 plugin architecture so this registry exposes
+    the same existence check its three siblings
+    (`cyberjection.attacks.registry`, `cyberjection.evaluators.registry`,
+    `cyberjection.reporting.registry`) do."""
+
+    return alias in _REGISTRY
+
+
 def get_mutator(alias: str, **kwargs: Any) -> BaseMutator:
     """Instantiate the mutator registered under ``alias``, forwarding
     ``kwargs`` to its constructor."""

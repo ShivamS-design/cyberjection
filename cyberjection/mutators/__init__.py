@@ -13,6 +13,7 @@ from cyberjection.mutators.registry import (
     MutatorRegistrationError,
     build_pipeline,
     get_mutator,
+    is_registered,
     list_mutator_aliases,
     register_mutator,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "MutatorRegistrationError",
     "build_pipeline",
     "get_mutator",
+    "is_registered",
     "list_mutator_aliases",
     "register_mutator",
 ]
