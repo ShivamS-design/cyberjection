@@ -17,14 +17,15 @@ Full documentation lives in [`docs/`](docs/):
 
 ## Status
 
-Phases 1-8 of the project roadmap are implemented: **Core Async
+Phases 1-9 of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
 Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
 Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, **CI/CD
 Pipeline Integration, CLI Harness & Enterprise Reporting**,
-**Distributed Worker Architecture, Task Queues & Rate Limiting Engine**, and
-**Security Auditing, Compliance & Production Hardening**. See
+**Distributed Worker Architecture, Task Queues & Rate Limiting Engine**,
+**Security Auditing, Compliance & Production Hardening**, and
+**Orchestrator**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
 plan and what ships in each stage.
 
@@ -176,6 +177,21 @@ plan and what ships in each stage.
   and `.gitlab-ci.yml`): fails the build on a known dependency
   vulnerability or a hardcoded secret, independent of the evaluation
   quality gate.
+
+### Phase 9: orchestrator
+
+- `cyberjection run` executes the real Phase 2-5 attack/evaluator stack
+  against the resolved target -- `cyberjection.orchestrator.campaign`
+  replaces the fixed-finding stub every earlier phase shipped with.
+- Concurrent test-case execution bounded by `CampaignConfig.max_workers`,
+  wired through a real `asyncio.Semaphore`.
+- Campaign persistence and resume support at the CLI: `run --db-url`
+  points at a non-default database, and `run --resume <campaign-id>`
+  continues a previously interrupted campaign, skipping already-completed
+  test cases.
+- A test-case execution failure (a provider outage, an unresolvable
+  strategy) downgrades to an `UNCERTAIN`, incomplete finding rather than
+  aborting the rest of the campaign.
 
 ## Installation
 

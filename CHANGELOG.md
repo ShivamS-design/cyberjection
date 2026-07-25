@@ -2,6 +2,143 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.9.0] - Phase 9: Orchestrator
+
+No PDF design spec exists for this phase either; scope was self-authored
+from task #76's own one-line description -- "wire the CLI's `run`
+pipeline stub through the real attack/evaluator/persistence stack,
+optionally the Phase 7 distributed queue" -- following explicit user
+direction to complete this phase in full before starting Phase 10.
+
+### Added
+
+- `cyberjection/orchestrator/` (new package): `CampaignOrchestrator`,
+  the object that runs a `CampaignConfig`'s test cases concurrently
+  (bounded by `max_workers` via an `asyncio.Semaphore`) against the real
+  Phase 1-5 attack/evaluator stack, and `execute_campaign()`, the async
+  entrypoint that opens persistence (when installed), creates or resumes
+  a campaign row, and marks it `COMPLETED`/`FAILED` when the run finishes.
+- `_execute_pipeline()` in `cli/main.py` -- a documented two-`Finding`
+  stub since Phase 6 -- now calls `execute_campaign()`, scoped to test
+  cases targeting the resolved `--target`.
+- Two new `run` flags: `--db-url` (campaign persistence database,
+  defaulting to the local SQLite results DB) and `--resume <campaign-id>`
+  (continue a previously interrupted campaign instead of starting a new
+  one, skipping test cases already `COMPLETED`). A `--resume` id that
+  doesn't resolve to a known campaign now exits `2` (usage error) rather
+  than either crashing or silently starting a fresh campaign.
+- New exceptions: `UnknownStrategyTypeError` (a `StrategyConfig.type`
+  matching no registered single-turn strategy or multi-turn engine) and
+  `CampaignNotFoundError` (a `--resume` id with no matching campaign row,
+  or given at all when persistence isn't installed).
+- `tests/unit/test_orchestrator.py`: pure-function coverage for the
+  strategy/cascade-evaluator factories and the multi-turn verdict
+  classifier; end-to-end single-turn execution against a monkeypatched
+  `litellm.acompletion`; multi-turn dispatch/goal-resolution/turn-
+  conversion against scripted `CrescendoEngine`/`TAPEngine` stand-ins;
+  configuration-error and provider-failure handling, including that one
+  failing test case doesn't abort the rest of a campaign's
+  `asyncio.gather`; every `ResumeDecision` branch, including that a
+  `RESUME`'d multi-turn test really does call the target again as a new
+  test row; persistence wiring against a duck-typed fake repository; a
+  12-vs-3 concurrency race proving `max_concurrency` is actually
+  enforced (mirroring `test_rate_limiter.py`'s own atomicity test); and
+  `execute_campaign`'s persistence-unavailable and
+  `--resume`-without-persistence paths.
+
+### Fixed
+
+- `cyberjection/security/__init__.py`'s module docstring claimed
+  `dependency_audit` falls back to "a small offline advisory dataset"
+  when `pip-audit` isn't installed -- direct contradiction of
+  `dependency_audit.py`'s actual, deliberately-designed behavior (it
+  never fabricates an offline CVE list, only ever returns
+  `source="unavailable"`) and of `docs/SECURITY.md`. Caught during this
+  phase's integrity sweep; corrected to describe the real fallback.
+- The offline `pytest`/`typer`/`rich`/`redis`/`celery` shims and the
+  `run_tests.py` runner (all environment-local, under `/tmp/_shims/`, not
+  part of the shipped package) needed to be rebuilt from scratch in this
+  phase's sandbox -- an unrelated, disposable environment to whatever
+  sandbox ran Phase 1-8's tests, with none of the previously-built shims
+  present. Two real bugs were caught and fixed during that rebuild, not
+  just gaps to fill in:
+  - The runner originally wrapped every test -- sync or async -- in one
+    outer `asyncio.run()` call. Several CLI commands (`inspect`, `run`)
+    call `asyncio.run()` themselves internally; a sync test exercising
+    either one hit `RuntimeError: asyncio.run() cannot be called from a
+    running event loop`, silently surfaced by `click.testing.CliRunner`
+    as a wrong exit code with no obvious cause rather than a raised
+    error. Fixed by only driving an event loop for `async def` test
+    functions -- matching how pytest-asyncio itself only manages a loop
+    for `@pytest.mark.asyncio`-marked tests -- and resolving/tearing down
+    a sync test's fixtures in their own short-lived `asyncio.run()` calls
+    instead.
+  - The offline `celery` shim's `Task.retry()` incremented
+    `self.request.retries` *before* checking it against `max_retries`,
+    so the dead-letter queue's logged `retries_exhausted` value came out
+    one higher than `MAX_RETRIES` -- caught by
+    `test_distributed_tasks.py::test_exhausted_task_is_pushed_to_dead_letter_queue`,
+    a pre-existing Phase 7 test this phase's shim rebuild had to satisfy
+    again. Fixed by checking before incrementing, matching what that
+    test (and real Celery's own `Task.retry` semantics) expects.
+- `tests/unit/test_cli.py`'s `TestRunQualityGateExitCodes` and
+  `TestRunExportFlags` classes asserted against the old stub's fixed
+  findings (`CJ-001`/`CJ-002` topping out at score `3.4`), which stopped
+  being true the moment `_execute_pipeline()` started calling the real
+  orchestrator -- `VALID_CONFIG` in that file declares no `tests:`
+  section, so the real pipeline now legitimately returns zero findings
+  for it. Fixed by adding an autouse `_stub_pipeline` fixture that mocks
+  `_execute_pipeline` with two canned findings reproducing the old stub's
+  shape, keeping this file scoped to what its own docstring says it
+  tests (CLI argument-parsing and exit-code behavior) rather than needing
+  a real or mocked LLM target.
+- `TestRunExportFlags::test_no_export_flags_writes_no_files` asserted
+  that a `run` invocation with no `--sarif-out`/`--json-out`/
+  `--markdown-out` flags wrote no files into `tmp_path` at all -- but
+  `audit.jsonl` (a real, expected side effect of every `run` invocation
+  since Phase 8's audit logging landed) is written into that same
+  `tmp_path`, so this assertion was failing regardless of Phase 9.
+  Fixed by excluding the known `audit.jsonl` side effect from the
+  before/after comparison rather than the file's raw listing.
+
+### Known limitations
+
+- **Multi-turn resume is not true mid-conversation resume.**
+  `CrescendoEngine.run()`/`TAPEngine.execute_tree_search()` both always
+  start a fresh `ConversationContext` from turn 1 -- neither accepts a
+  pre-seeded conversation history. A `ResumeDecision.RESUME` (a
+  partially-completed prior multi-turn test) is handled by logging a
+  warning and re-running the test case from scratch as a **new**
+  `TestModel` row, rather than either pretending to resume mid-
+  conversation or leaving `RESUME` unhandled. True mid-conversation
+  resume needs both engines to accept seeded history first; not
+  attempted in this phase.
+- **`CampaignConfig.max_cost_cap` is still not enforced.**
+  `UsageMetrics` carries token counts, not a real per-call cost figure,
+  so there is no real cost signal to check a cap against yet. Enforcing
+  one against a fabricated estimate would be worse than not enforcing one
+  at all -- the same "don't fabricate a number to look complete"
+  principle `dependency_audit`'s honest `source="unavailable"` already
+  established for this project.
+- **The distributed queue remains unwired.** `execute_eval_turn_task`'s
+  signature (`target_id, payload, provider_url`) has no path to a live
+  campaign/target/evaluator context; wiring it honestly would mean
+  redesigning that signature, not calling it as-is. Every campaign this
+  phase runs executes locally.
+- **`TAPEngine`'s own tuning knobs aren't exposed via `StrategyConfig`.**
+  `branching_factor`/`max_depth`/`pruning_threshold`/`success_threshold`
+  all use their class defaults for every campaign; only `max_turns`
+  (Crescendo) and `attacker_model` (both engines) are threaded through
+  from campaign YAML.
+
+### Offline test harness changes
+
+See the "Fixed" section above for the full detail on rebuilding the
+offline shim stack and the two real bugs (the nested-`asyncio.run()`
+runner bug, and the celery shim's off-by-one retry count) caught and
+fixed during that rebuild. All shim/runner files are environment-local,
+under `/tmp/_shims/`, not part of the shipped package.
+
 ## [0.8.0] - Phase 8: Security Auditing, Compliance & Production Hardening
 
 No PDF design spec exists for this phase (unlike every phase before it);
