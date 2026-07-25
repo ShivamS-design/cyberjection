@@ -59,12 +59,17 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         control_id="ASVS-V2",
         framework=ASVS,
         title="Authentication controls",
-        status=ControlStatus.NOT_APPLICABLE,
-        evidence=(),
+        status=ControlStatus.PARTIAL,
+        evidence=("cyberjection/api/", "docker-compose.yml", "docs/DEPLOYMENT.md"),
         notes=(
-            "Cyberjection is a locally-run CLI/library with no network-facing "
-            "authentication surface as of Phase 8. Revisit once Phase 10's web "
-            "dashboard/API introduces one."
+            "Phase 10's dashboard API (cyberjection.api) introduced Cyberjection's first "
+            "network-facing surface, and it deliberately implements no authentication of its "
+            "own -- the 'single trusted team, one instance' deployment model documented in "
+            "docs/DEPLOYMENT.md puts the operator's own network perimeter/reverse proxy in "
+            "front of it instead of building a second, likely-worse auth layer inside this "
+            "project. Every endpoint is also read-only (see docs/ARCHITECTURE.md's Phase 10 "
+            "section), so the surface an unauthenticated caller can reach is bounded to "
+            "already-completed campaign history, not campaign execution."
         ),
     ),
     ControlMapping(
@@ -73,7 +78,12 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         title="Access control",
         status=ControlStatus.NOT_APPLICABLE,
         evidence=(),
-        notes="Single-operator CLI tool; no multi-user authorization boundary exists yet.",
+        notes=(
+            "Still no multi-user authorization boundary: the CLI remains single-operator, "
+            "and Phase 10's dashboard API has no user/session concept to scope access "
+            "within -- see ASVS-V2's note above for why that's a deployment-perimeter "
+            "decision rather than an in-app access-control gap."
+        ),
     ),
     ControlMapping(
         control_id="ASVS-V5.1",
@@ -136,9 +146,22 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         control_id="ASVS-V13",
         framework=ASVS,
         title="API and web service security controls",
-        status=ControlStatus.NOT_APPLICABLE,
-        evidence=(),
-        notes="No REST API exists yet as of Phase 8; revisit when Phase 10 ships one.",
+        status=ControlStatus.PARTIAL,
+        evidence=(
+            "cyberjection/api/asgi.py",
+            "cyberjection/api/app.py",
+            "tests/unit/test_api.py",
+            "tests/unit/test_api_persistence.py",
+        ),
+        notes=(
+            "The REST API Phase 10 ships is intentionally minimal and read-only (5 GET "
+            "endpoints, no mutation, no request body parsing -- see "
+            "cyberjection/api/asgi.py's module docstring), which removes several ASVS-V13 "
+            "subcontrols by construction (no injection surface via a request body, no "
+            "state-changing endpoint to authorize). It does not implement authentication, "
+            "rate limiting, or CORS policy -- those are left to the deployment's own reverse "
+            "proxy per docs/DEPLOYMENT.md, not implemented in-app."
+        ),
     ),
     ControlMapping(
         control_id="ASVS-V14.2",
