@@ -86,6 +86,21 @@ degrades to an honest `source="unavailable"` result rather than skipping
 or failing when the `security` extra isn't installed. `test_dependency_audit.py`
 exercises that real fallback path directly rather than mocking it.
 
+To run only the Phase 9 suite:
+
+```bash
+pytest tests/unit/test_orchestrator.py -v
+```
+
+`test_orchestrator.py` needs no `pytest.importorskip` -- persistence tests
+use a duck-typed `_FakeRepository`/`_FakeResumabilityManager` rather than
+a real database, and multi-turn tests replace `CrescendoEngine`/`TAPEngine`
+with scripted stand-ins rather than requiring a real LLM. Single-turn
+tests run through the real strategy classes and `LiteLLMTarget` with
+`litellm.acompletion` monkeypatched, the same convention
+`test_single_turn_attacks.py` uses, so this file also catches wiring bugs
+between the orchestrator and the real attack/target stack.
+
 ## Layout
 
 | File | Covers |
@@ -120,6 +135,7 @@ exercises that real fallback path directly rather than mocking it.
 | `tests/unit/test_secrets_audit.py` | `scan_text_for_secrets` against every registered pattern (AWS keys, private key headers, Slack/GitHub tokens, generic API-key assignments) and placeholder-marker suppression; `scan_paths_for_secrets` (recursive walk, excluded-dir skipping, binary-file tolerance); `scan_campaign_config_for_hardcoded_secrets` (literal-vs-`${VAR}`-interpolated `api_key` values). |
 | `tests/unit/test_dependency_audit.py` | `parse_pip_audit_json` against canned `pip-audit --format json` fixtures (single/multiple findings, missing fields, truncation, malformed input); `run_dependency_audit`'s real `source="unavailable"` fallback in this sandbox; `evaluate_dependency_gate`'s pass/fail decision across every `source` value and `fail_on_unavailable` setting. |
 | `tests/unit/test_compliance.py` | Structural invariants of the real `CONTROL_REGISTRY` (unique ids, evidence required for `IMPLEMENTED`, notes required for `NOT_APPLICABLE`) plus `compliance_summary`/`generate_compliance_report` against both the real registry and small synthetic ones (grouping order, missing-evidence/notes rendering, multiline-note flattening). |
+| `tests/unit/test_orchestrator.py` | `_build_cascade_evaluator`/`_build_strategy`/`_verdict_from_multi_turn` pure-function behavior; single-turn execution end-to-end against a monkeypatched `litellm.acompletion`; multi-turn dispatch/goal-resolution/turn-conversion against scripted `CrescendoEngine`/`TAPEngine` stand-ins; configuration-error and provider-failure handling (a failing test case never aborts the others); resumability's `SKIP_COMPLETE`/`RESUME`/no-manager paths (including that a `RESUME`'d test really does call the target again, as a fresh row); persistence wiring against a duck-typed fake repository; `max_concurrency` actually bounding in-flight test cases (a 12-vs-3 concurrency race, mirroring `test_rate_limiter.py`'s own atomicity test); and `execute_campaign`'s persistence-unavailable and `--resume`-without-persistence paths. |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions

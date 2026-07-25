@@ -363,15 +363,17 @@ still reports how close the attack got.
 
 ### Cost and orchestration status
 
-Neither engine enforces `CampaignConfig.max_cost_cap` or is wired to
-`StrategyConfig.max_turns` from campaign YAML yet -- both are constructed
-directly in Python for now, the same interim state Phase 2's mutator
-pipeline and Phase 3's cascade evaluator shipped in before their respective
-orchestrator wiring landed. `TAPEngine`'s branch count grows as
-`branching_factor ** depth`, so a full unpruned search under the defaults
-(`branching_factor=3`, `max_depth=5`) can reach several hundred target +
-attacker + evaluator calls; `pruning_threshold` is the only cost control
-until campaign-level budget wiring exists.
+As of Phase 9, `cyberjection.orchestrator.campaign` constructs both
+engines from real campaign YAML: `StrategyConfig.max_turns` reaches
+`CrescendoEngine` directly, and `StrategyConfig.attacker_model` selects
+the `AttackerAgent`'s model. `CampaignConfig.max_cost_cap` is still not
+enforced anywhere -- see the Phase 9 section below for why that's a
+deliberate omission rather than an oversight, not an interim state waiting
+on later wiring the way this subsection described before Phase 9.
+`TAPEngine`'s branch count still grows as `branching_factor ** depth`, so
+a full unpruned search under the defaults (`branching_factor=3`,
+`max_depth=5`) can reach several hundred target + attacker + evaluator
+calls; `pruning_threshold` remains the only cost control on that growth.
 
 ## Phase 6: CI/CD Pipeline Integration, CLI Harness & Enterprise Reporting
 
@@ -423,17 +425,18 @@ deduplicated by `rule_id` instead of growing one entry per finding --
 important because SARIF's `rules` array is meant to be a one-entry-per-rule
 catalog referenced *by* `ruleIndex`, not a per-result log.
 
-### The `run` pipeline is a documented stub
+### The `run` pipeline was a documented stub through Phase 8
 
-`_execute_pipeline()` in `cli/main.py` returns fixed findings rather than
-actually invoking the Phase 2-5 attack/evaluator machinery against the
-resolved target -- see [Cost and orchestration status](#cost-and-orchestration-status)
-above and the Known Limitations section of the Phase 6 changelog entry.
-It's shaped exactly like the eventual real implementation (same
-parameters, same `List[Finding]` return type) specifically so wiring in a
-real orchestrated run later is a body replacement, not an interface
-change for every caller (the CLI, and any future orchestrator entrypoint)
-that already depends on it.
+`_execute_pipeline()` in `cli/main.py` returned two fixed findings rather
+than actually invoking the Phase 2-5 attack/evaluator machinery against
+the resolved target, from the moment it was written in this phase through
+the end of Phase 8. Phase 9's `cyberjection.orchestrator.campaign` module
+is the real implementation that replaced its body -- see the Phase 9
+section below. It was shaped, from this phase onward, exactly like the
+eventual real implementation (same parameters, same `List[Finding]`
+return type) specifically so that replacement was a body swap, not an
+interface change for every caller (the CLI, and the orchestrator itself)
+that already depended on it -- which is exactly how Phase 9 landed it.
 
 ## Phase 7: Distributed Worker Architecture, Task Queues & Rate Limiting Engine
 
@@ -482,15 +485,19 @@ re-raising, so a permanently-failing task leaves a record an operator can
 inspect and replay rather than silently vanishing into a Celery FAILURE
 result nobody's watching.
 
-### Not yet wired into the orchestrator
+### Still not wired into the orchestrator, by deliberate choice
 
-Same status as the Phase 4 persistence layer before Phase 5 wired
-resumability into anything, and the Phase 6 CLI's still-stubbed
-`_execute_pipeline()`: `cyberjection/distributed/` ships as a complete,
-independently-tested subsystem, but nothing in this phase decides *when*
-a campaign should dispatch to the distributed queue instead of running
-locally. See [Cost and orchestration status](#cost-and-orchestration-status)
-and the Known Limitations section of the Phase 7 changelog entry.
+At the time this phase shipped, this was the same status as the Phase 4
+persistence layer before Phase 5 wired resumability into anything, and the
+Phase 6 CLI's still-stubbed `_execute_pipeline()`. Phase 9 wired the
+persistence layer and the attack/evaluator stack into a real orchestrator,
+but explicitly left `cyberjection/distributed/` unwired: `execute_eval_turn_task`'s
+signature (`target_id, payload, provider_url`) has no path to a live
+campaign/target/evaluator context, so wiring it honestly would mean
+redesigning that signature, not calling it as-is. `cyberjection/distributed/`
+remains a complete, independently-tested subsystem that every campaign run
+today executes locally rather than dispatching to. See the Phase 9
+section below for the explicit scope boundary this was left at.
 
 ## Phase 8: Security Auditing, Compliance & Production Hardening
 
@@ -571,6 +578,78 @@ Phase 10's web dashboard/API introduces those surfaces). It is not, and
 does not claim to be, a substitute for an actual third-party audit or
 SOC 2 report, which only a licensed CPA firm can issue.
 
+## Phase 9: Orchestrator
+
+Wires the CLI's `run` pipeline stub through the real Phase 1-5
+attack/evaluator stack and the Phase 4 persistence layer -- the module
+every phase from 2 through 8 shipped standalone specifically so a later
+phase could replace `_execute_pipeline()`'s body without touching any of
+its callers. This phase is that later phase.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/orchestrator/campaign.py` | `CampaignOrchestrator`: runs a `CampaignConfig`'s test cases concurrently (bounded by `max_workers`) against the real attack strategies, `CascadeEvaluator`, and `LiteLLMTarget`, converting results into `Finding`s. `execute_campaign()`: the async entrypoint that opens persistence (when installed), creates or resumes a campaign row, and marks it COMPLETED/FAILED. |
+| `cyberjection/cli/main.py` (`run` command) | `_execute_pipeline()`'s body is now a real call into `execute_campaign()`, scoped to the resolved `--target`; two new flags, `--db-url` and `--resume`, expose campaign persistence and resume-by-id at the CLI. |
+| `cyberjection/utils/exceptions.py` | `UnknownStrategyTypeError` (a `StrategyConfig.type` matching no registered strategy or engine) and `CampaignNotFoundError` (a `--resume` id with no matching campaign row). |
+
+### Two layers: a pure orchestrator, and its I/O-opening entrypoint
+
+`CampaignOrchestrator` never opens a database connection itself --
+`repository`/`resumability` are constructor arguments the caller already
+has open, or `None` for a persistence-free run. This mirrors the
+pure-function/I/O split `cyberjection.reporting.quality_gate` and
+`cyberjection.persistence.resumability` already use, and is what makes
+`CampaignOrchestrator` unit-testable against plain duck-typed stand-ins
+(`tests/unit/test_orchestrator.py`) rather than a real SQLAlchemy
+database. `execute_campaign()` is the free function that actually opens
+`DatabaseManager`, creates or resumes a campaign row, and hands a
+newly-built `CampaignOrchestrator` its session-backed repository.
+
+### Multi-turn resume is not true mid-conversation resume
+
+`CrescendoEngine.run()` and `TAPEngine.execute_tree_search()` both always
+start a fresh `ConversationContext` from turn 1 -- neither accepts a
+pre-seeded conversation history. So when `decide_resume_action()` returns
+`ResumeDecision.RESUME` for a multi-turn test case (a prior run persisted
+some, but not all, of its turns before being interrupted), the
+orchestrator cannot hand those turns back to the engine and continue from
+where it left off. What it does instead: logs a warning and re-runs the
+test case from scratch as a **new** `TestModel` row, rather than either
+(a) silently pretending to resume when it can't, or (b) leaving
+`ResumeDecision.RESUME` unhandled and crashing. A new row (instead of
+reusing the abandoned one) avoids a `(test_id, turn_number)` uniqueness
+collision with turns the interrupted run already persisted. True
+mid-conversation resume would require both multi-turn engines to accept
+seeded history -- not attempted in this phase; see
+`tests/unit/test_orchestrator.py::TestResumability::test_incomplete_prior_state_is_rerun_fresh`
+for the behavior this locks in.
+
+### `max_cost_cap` is deliberately not enforced
+
+`CampaignConfig.max_cost_cap` is part of the Phase 1 schema, but nothing
+in this codebase computes a real per-call dollar cost --
+`cyberjection.providers.litellm_provider.UsageMetrics` carries token
+counts, not a cost figure. Enforcing a cap against a fabricated cost
+estimate would fail in both directions (false-positive budget cutoffs
+against actual spend, or false confidence that spend is bounded when it
+isn't) and would contradict the same "don't fabricate a number to look
+complete" principle `cyberjection.security.dependency_audit` already
+established for this project (an honest `source="unavailable"` rather
+than a stale offline CVE list). `max_cost_cap` enforcement stays
+unimplemented until a real per-call cost signal exists to check it
+against, rather than shipping a cap that checks a number nobody trusts.
+
+### The distributed queue remains unwired
+
+Per the Phase 7 section above, `cyberjection/distributed/` was left
+unwired to any orchestrator on purpose: `execute_eval_turn_task`'s
+signature has no path to a live campaign/target/evaluator context, and
+wiring it honestly would mean redesigning that signature, not calling it
+as-is from `CampaignOrchestrator`. Every campaign this phase runs executes
+locally, concurrency-bounded by `max_workers` via an `asyncio.Semaphore`,
+not dispatched to Celery workers. Real distributed dispatch remains a
+documented follow-up.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -582,8 +661,8 @@ SOC 2 report, which only a licensed CPA firm can issue.
 | 5 | Stateful multi-turn adaptive attack engine (Crescendo, TAP) |
 | 6 | CI/CD pipeline integration, CLI harness (Typer + Rich), enterprise reporting (SARIF, JSON, Markdown) |
 | 7 | Distributed worker architecture: Celery + Redis task queues, atomic cluster-wide RPM/TPM rate limiting, Pub/Sub abort coordination, retry/dead-letter fault tolerance |
-| 8 (current) | Security auditing, compliance & production hardening: output-path/SSRF/payload-size guards, hash-chained audit log, secrets/dependency scanning, ASVS/SOC2 control self-assessment |
-| 9 | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack (and, per Phase 7, optionally the distributed queue) |
+| 8 | Security auditing, compliance & production hardening: output-path/SSRF/payload-size guards, hash-chained audit log, secrets/dependency scanning, ASVS/SOC2 control self-assessment |
+| 9 (current) | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack; distributed-queue dispatch and `max_cost_cap` enforcement remain explicit follow-ups |
 | 10 | Plugin architecture, web dashboard, container deployment |
 
 ## Data model

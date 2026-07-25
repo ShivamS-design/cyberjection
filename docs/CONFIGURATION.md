@@ -234,10 +234,13 @@ tap = TAPEngine(evaluator=evaluator, attacker=attacker, branching_factor=3, max_
 | `CrescendoEngine` | `max_turns` (default `10`), `max_backtracks` (default `5`), `success_threshold` (default `8.0`) | `run(target, goal, initial_prompt)` is an async generator yielding one `AttackNode` per turn attempted. |
 | `TAPEngine` | `branching_factor` (default `3`), `max_depth` (default `5`), `pruning_threshold` (default `3.0`), `success_threshold` (default `8.0`) | `execute_tree_search(target, goal, seed_prompt)` returns the winning (or best-explored) root-to-leaf `List[AttackNode]`. |
 
-Neither engine is yet wired to `StrategyConfig.max_turns` or campaign YAML;
-both are constructed directly in Python for now, the same interim state
-Phase 2's mutator pipeline and Phase 3's cascade evaluator shipped in
-before orchestrator wiring landed.
+As of Phase 9, `cyberjection.orchestrator.campaign` constructs both engines
+from real campaign YAML: `StrategyConfig.max_turns`/`attacker_model` reach
+`CrescendoEngine` and the `AttackerAgent` it and `TAPEngine` share
+directly. `TAPEngine`'s own `branching_factor`/`max_depth`/
+`pruning_threshold`/`success_threshold` are not yet exposed as
+`StrategyConfig` fields and still use their class defaults for every
+campaign.
 
 ## CLI: `cyberjection`
 
@@ -247,27 +250,30 @@ Phase 6 adds a Typer + Rich command-line harness, installed as the
 ```bash
 cyberjection run --config examples/quickstart.yaml --target support-agent \
   --threshold 7.0 --sarif-out results.sarif --json-out results.json --markdown-out results.md
+cyberjection run --config examples/quickstart.yaml --target support-agent --resume <campaign-id>
 cyberjection inspect --limit 10
 cyberjection export --from-json results.json --output results.sarif --format sarif
 ```
 
 | Command | Key options | Notes |
 |---|---|---|
-| `run` | `--config`/`-c` (default `cyberjection.yaml`), `--target`/`-t` (required), `--threshold`, `--sarif-out`, `--json-out`, `--markdown-out` | Loads the campaign config, resolves the target, runs the evaluation pipeline, applies the quality gate, and exits `0`/`1`/`2` (see below). `--threshold` overrides the campaign's `quality_gate.threshold`; omitting both falls back to `7.0`. |
+| `run` | `--config`/`-c` (default `cyberjection.yaml`), `--target`/`-t` (required), `--threshold`, `--sarif-out`, `--json-out`, `--markdown-out`, `--db-url`, `--resume` | Loads the campaign config, resolves the target, runs the evaluation pipeline through the real Phase 9 orchestrator, applies the quality gate, and exits `0`/`1`/`2` (see below). `--threshold` overrides the campaign's `quality_gate.threshold`; omitting both falls back to `7.0`. `--db-url` points campaign persistence at a non-default database (falls back to the local SQLite results DB; ignored if `sqlalchemy`/`aiosqlite` aren't installed). `--resume <campaign-id>` continues a previously interrupted campaign (see `cyberjection inspect` for known ids) instead of starting a new one, skipping test cases already `COMPLETED`; exits `2` if the given id doesn't resolve to a known campaign. |
 | `inspect` | `--db-url`, `--limit` (default `10`) | Lists recently persisted campaigns via `CampaignRepository.list_recent_campaigns`. Requires the Phase 4 persistence layer (`sqlalchemy`, `aiosqlite`). |
 | `export` | `--from-json` (required), `--output`/`-o` (required), `--format`/`-f` (`sarif` or `markdown`, default `sarif`), `--threshold` | Re-renders a prior `run --json-out` report into another format without re-running an evaluation. |
 
 **Exit codes:** `0` quality gate passed, `1` quality gate failed (the run
 executed correctly but a finding met or exceeded the threshold), `2` a
 usage/configuration error (bad config file, unknown target id, missing
-input file), `3` an environment error (a command's runtime dependency
-isn't installed, e.g. `inspect` without `sqlalchemy`).
+input file, or an unresolvable `--resume` campaign id), `3` an environment
+error (a command's runtime dependency isn't installed, e.g. `inspect`
+without `sqlalchemy`).
 
-`_execute_pipeline()` behind `run` is currently a documented stub
-returning fixed findings rather than invoking the real Phase 2-5
-attack/evaluator stack -- see
-[Cost and orchestration status](ARCHITECTURE.md#cost-and-orchestration-status)
-in the architecture doc.
+As of Phase 9, `run` executes the real Phase 2-5 attack/evaluator stack
+through `cyberjection.orchestrator.campaign.execute_campaign` rather than
+the fixed-finding stub earlier phases shipped with -- see the Phase 9
+section of the architecture doc for the orchestrator's design, its
+multi-turn-resume limitation, and what's deliberately still not wired
+(`max_cost_cap` enforcement, distributed dispatch).
 
 ## Reporting: SARIF, JSON, Markdown
 
