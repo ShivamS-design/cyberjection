@@ -131,6 +131,20 @@ class UnknownStrategyTypeError(CyberjectionException):
     arbitrary id a campaign author assigns."""
 
 
+class PluginLoadError(CyberjectionException):
+    """Raised by `cyberjection.plugins.loader.discover_plugins` when a
+    third-party plugin advertised under one of the
+    ``cyberjection.mutators``/``cyberjection.strategies``/
+    ``cyberjection.evaluators``/``cyberjection.exporters`` entry-point
+    groups fails to import or fails its subsystem registry's own
+    registration check (wrong base class, alias collision with a
+    different class). Carries the offending entry point's name and group
+    in the message so a broken plugin install is reported clearly rather
+    than surfacing as a bare `ImportError`/`AttributeError` traceback, or
+    -- worse -- silently discarding every plugin after the first bad one.
+    """
+
+
 class CampaignNotFoundError(CyberjectionException):
     """Raised by `cyberjection.orchestrator.campaign.execute_campaign` when
     `--resume <campaign_id>` references a campaign id that isn't present
