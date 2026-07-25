@@ -118,3 +118,23 @@ class DependencyAuditError(CyberjectionException):
     vulnerabilities, which is not an error -- it's the audit doing its
     job). Distinguishes "the audit tool crashed" from "the audit tool
     reported bad news"."""
+
+
+class UnknownStrategyTypeError(CyberjectionException):
+    """Raised by `cyberjection.orchestrator.campaign` when a
+    `StrategyConfig.type` doesn't match any registered single-turn
+    strategy alias (`direct_prompt_injection`, `jailbreak`,
+    `jailbreak_roleplay`, `system_prompt_extraction`) or multi-turn engine
+    name (`crescendo`, `tap`). Distinct from `UnknownTargetError` (a
+    `--target`/`test.target` id that doesn't resolve) since a strategy
+    *type* is a fixed vocabulary the orchestrator implements, not an
+    arbitrary id a campaign author assigns."""
+
+
+class CampaignNotFoundError(CyberjectionException):
+    """Raised by `cyberjection.orchestrator.campaign.execute_campaign` when
+    `--resume <campaign_id>` references a campaign id that isn't present
+    in the persistence layer -- a typo'd or already-deleted campaign id,
+    caught at the orchestrator boundary rather than surfacing as a `None`
+    silently treated as "start fresh," which would resume nothing while
+    claiming to."""
