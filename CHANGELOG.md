@@ -2,6 +2,123 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.10.0] - Phase 10: Plugin Architecture, Web Dashboard, Container Deployment
+
+No PDF design spec exists for this phase either; scope was self-authored
+from the roadmap's own one-line description in `docs/ARCHITECTURE.md`
+("Plugin architecture, web dashboard, container deployment"), following
+explicit user direction to complete Phase 9 in full before starting this
+one.
+
+### Added
+
+- Three new subsystem alias registries, each mirroring
+  `cyberjection.mutators.registry`'s registration/collision/idempotency
+  contract exactly: `cyberjection/attacks/registry.py` (single-turn
+  strategies -- `direct_prompt_injection`, `jailbreak`/
+  `jailbreak_roleplay`, `system_prompt_extraction`), `cyberjection/
+  evaluators/registry.py` (`regex`, `onnx`, `llm_judge`), and
+  `cyberjection/reporting/registry.py` (`json`, `markdown`, `sarif`).
+  `cyberjection.orchestrator.campaign._build_strategy` now resolves
+  strategies through the new registry instead of a hardcoded dict, and
+  `cyberjection export --format` consults the exporter registry for any
+  format beyond the two built-ins it already special-cased.
+- `cyberjection/plugins/` (new package): `discover_plugins()` scans
+  `importlib.metadata.entry_points()` across four groups
+  (`cyberjection.mutators`/`.strategies`/`.evaluators`/`.exporters`),
+  imports each referenced object, and registers it into the matching
+  registry above under the entry point's own name -- so a plugin's alias
+  works everywhere a built-in one does, with no separate plugin registry
+  involved. Best-effort by default (`strict=False`): one broken plugin
+  is reported as a `PluginLoadError`, not fatal to loading the others;
+  `strict=True` raises on the first failure instead.
+- `cyberjection/api/` (new package): `cyberjection.api.asgi`, a
+  dependency-free ASGI 3.0 toolkit (router with `{param}` path matching,
+  request/response types, `lifespan` handling) built on nothing but the
+  standard library; `cyberjection.api.app`, five read-only REST endpoints
+  (`/api/health`, `/api/plugins`, `/api/campaigns`, `/api/campaigns/
+  {id}`, `/api/campaigns/{id}/tests/{id}`) over the Phase 4 persistence
+  layer and the plugin registries; `cyberjection.api.server`, the
+  `uvicorn`-backed entrypoint (`uvicorn` is a new optional `api` extra in
+  `pyproject.toml`, not a hard dependency of the app itself).
+- Two new CLI commands: `cyberjection plugins` (lists every registered
+  alias by group, discovering third-party ones first; reports load
+  failures without aborting the listing) and `cyberjection serve --host
+  --port --db-url` (runs the dashboard API under `uvicorn`; exits with a
+  clear environment error, matching `inspect`'s SQLAlchemy-unavailable
+  path, if `uvicorn` isn't installed).
+- `apps/dashboard/`: a Vite + React + TypeScript single-page app
+  (campaigns list, campaign detail, test transcript detail, plugins
+  page) consuming `cyberjection.api`'s REST endpoints via relative
+  `/api/...` fetches, with an nginx-based production Docker image
+  (`apps/dashboard/Dockerfile`, `apps/dashboard/nginx.conf`).
+- Root `Dockerfile` (multi-stage Python build for the CLI/API,
+  non-root runtime user) and `docker-compose.yml` (API + dashboard, plus
+  an optional `--profile distributed` Redis service) for the "single
+  trusted team, one instance" deployment model documented in the new
+  `docs/DEPLOYMENT.md`.
+- New exception: `PluginLoadError` (a plugin's entry point failed to
+  import or failed its subsystem registry's own validation).
+- `is_registered()` added to `cyberjection.mutators.registry` (the one
+  registry function the Phase 2 original didn't have that its three new
+  siblings all do), for symmetry across all four registries.
+- `tests/unit/test_registries.py` (the three new subsystem registries),
+  `tests/unit/test_plugins.py` (plugin discovery against fake entry
+  points, covering success, non-fatal failure, `strict=True`, and an
+  unknown group), `tests/unit/test_api.py` (the ASGI toolkit plus
+  `/api/health`/`/api/plugins`/the persistence-unavailable 503 path,
+  always runnable), and `tests/unit/test_api_persistence.py` (the
+  campaign/test endpoints' happy path against a real in-memory database,
+  `pytest.importorskip`-gated like `test_repository.py`). `TestPluginsCommand`
+  and `TestServeCommand` added to `tests/unit/test_cli.py`.
+- ASVS-V2 (authentication controls) and ASVS-V13 (API and web service
+  security controls) in `cyberjection/security/compliance.py`'s
+  `CONTROL_REGISTRY` moved from `NOT_APPLICABLE` to `PARTIAL`, now that
+  `cyberjection.api` gives the project its first network-facing surface
+  -- honestly reflecting that it ships with no authentication of its own
+  by design (see `docs/DEPLOYMENT.md`), not silently left as "not
+  applicable" once an API actually exists. `docs/COMPLIANCE.md`
+  regenerated to match.
+
+### Why not FastAPI
+
+The architecture diagram in `docs/ARCHITECTURE.md` has said `apps/api
+(FastAPI)` since Phase 1, but `cyberjection.api` doesn't depend on
+FastAPI, Starlette, or any ASGI server. Neither is guaranteed
+installable in every environment this project already commits to
+supporting without network access to a package registry -- the same
+constraint that led `cyberjection.cli.main` to build on `typer`/`rich`
+in Phase 6 rather than a heavier framework. `ASGIApp` implements the
+ASGI 3.0 protocol directly, so it runs unmodified under any real ASGI
+server in production; only `cyberjection.api.server.run_server` ever
+imports `uvicorn`, and only when a caller actually asks to serve HTTP
+traffic.
+
+### Known limitations
+
+- **The dashboard is read-only.** Every `cyberjection.api.app` endpoint
+  is a `GET`; starting, resuming, or editing a campaign stays CLI-only.
+  Not an oversight -- see `docs/ARCHITECTURE.md`'s Phase 10 section.
+- **No authentication.** `cyberjection.api` has no auth layer of its
+  own; the "single trusted team, one instance" model in
+  `docs/DEPLOYMENT.md` expects the operator's own network perimeter or
+  reverse proxy to sit in front of it. Tracked honestly as `PARTIAL`,
+  not `IMPLEMENTED`, in `docs/COMPLIANCE.md`.
+- **`apps/dashboard` could not be `npm run build`/`tsc --noEmit`
+  verified in this project's hard-testing sandbox** -- no network access
+  to the npm registry there (the same constraint that blocked installing
+  `fastapi`; see `docs/TESTING.md`'s Phase 10 section for the exact
+  error and what was verified instead: the source was written and
+  reviewed against the JSON shapes `cyberjection.api.app`'s own test
+  suite asserts on, and kept dependency-minimal).
+- **`cyberjection.evaluators.registry` isn't consulted by
+  `CascadeEvaluator`'s own tier construction.** Tier 1/2/3 each occupy a
+  specific, load-bearing position in the cascade that a registry lookup
+  alone doesn't express; the registry exists for listing/discovery and
+  standalone construction, not to replace the cascade's fixed structure.
+- **The distributed queue remains unwired**, per Phase 7/9's own notes --
+  unchanged by this phase.
+
 ## [0.9.0] - Phase 9: Orchestrator
 
 No PDF design spec exists for this phase either; scope was self-authored

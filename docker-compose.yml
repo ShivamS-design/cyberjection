@@ -1,0 +1,66 @@
+# Single-instance deployment for one trusted team (see docs/DEPLOYMENT.md):
+# the dashboard API, the web dashboard, and (optionally) the Phase 7
+# Redis broker for distributed campaign workers, all on one private
+# Docker network with no built-in authentication -- put this behind your
+# own reverse proxy / VPN / SSO layer before exposing it beyond
+# localhost. Multi-tenant Workspace-style isolation is out of scope for
+# this compose file; see docs/DEPLOYMENT.md's "Not in scope" section.
+#
+# Usage:
+#   docker compose up --build
+#   docker compose --profile distributed up --build   # also starts redis
+#
+# Campaign history persists in the `cyberjection-data` named volume
+# (SQLite by default) across restarts; delete it with
+# `docker compose down -v` to start clean.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cyberjection-api:0.10.0
+    container_name: cyberjection-api
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000", "--db-url", "sqlite+aiosqlite:////data/results.db"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - cyberjection-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  dashboard:
+    build:
+      context: ./apps/dashboard
+      dockerfile: Dockerfile
+    image: cyberjection-dashboard:0.10.0
+    container_name: cyberjection-dashboard
+    environment:
+      API_UPSTREAM: "http://api:8000"
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # Only needed for Phase 7's distributed Celery/Redis worker pool
+  # (cyberjection/distributed); the API and dashboard above work fully
+  # without it (a single-process campaign run doesn't touch this queue --
+  # see docs/ARCHITECTURE.md's "distributed queue remains unwired" note).
+  redis:
+    image: redis:7-alpine
+    container_name: cyberjection-redis
+    profiles: ["distributed"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - cyberjection-redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  cyberjection-data:
+  cyberjection-redis-data:

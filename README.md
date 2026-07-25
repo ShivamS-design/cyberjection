@@ -13,21 +13,22 @@ Full documentation lives in [`docs/`](docs/):
 - [Testing guide](docs/TESTING.md) - running and extending the test suite
 - [Security policy](docs/SECURITY.md) - hardening controls and vulnerability disclosure
 - [Compliance self-assessment](docs/COMPLIANCE.md) - OWASP ASVS 4.0 / SOC 2 control mapping
+- [Deployment guide](docs/DEPLOYMENT.md) - running the dashboard API/web dashboard, with or without Docker
 - [Changelog](CHANGELOG.md) - release notes per phase
 
 ## Status
 
-Phases 1-9 of the project roadmap are implemented: **Core Async
+All 10 phases of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
 Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
 Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, **CI/CD
 Pipeline Integration, CLI Harness & Enterprise Reporting**,
 **Distributed Worker Architecture, Task Queues & Rate Limiting Engine**,
-**Security Auditing, Compliance & Production Hardening**, and
-**Orchestrator**. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full 10-phase
-plan and what ships in each stage.
+**Security Auditing, Compliance & Production Hardening**, **Orchestrator**,
+and **Plugin Architecture, Web Dashboard & Container Deployment**. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full
+10-phase plan and what shipped in each stage.
 
 ## Features
 
@@ -193,6 +194,26 @@ plan and what ships in each stage.
   strategy) downgrades to an `UNCERTAIN`, incomplete finding rather than
   aborting the rest of the campaign.
 
+### Phase 10: plugin architecture, web dashboard & container deployment
+
+- Third-party plugin discovery (`cyberjection.plugins.discover_plugins`)
+  via Python packaging entry points across four groups (mutators,
+  single-turn strategies, evaluators, report exporters) -- a plugin's
+  alias works everywhere a built-in one does (campaign YAML, `cyberjection
+  export --format`), with no fifth "plugin registry" involved.
+- `cyberjection plugins` lists every registered alias by group; a broken
+  plugin is reported, not fatal to the listing.
+- A dependency-free dashboard REST API (`cyberjection.api`, served via
+  `cyberjection serve`): five read-only endpoints over campaign/test
+  history and the plugin registries, built on nothing but the standard
+  library so it never requires FastAPI/Starlette to be installed.
+- A Vite + React + TypeScript web dashboard (`apps/dashboard/`): campaign
+  list, campaign detail, full conversation-transcript test detail, and a
+  plugins page.
+- Multi-stage container images (`Dockerfile`, `apps/dashboard/Dockerfile`)
+  and a `docker-compose.yml` for the "single trusted team, one instance"
+  deployment model documented in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 ## Installation
 
 ```bash
@@ -342,26 +363,44 @@ cyberjection audit --compliance --report audit-report.md
 # the gate on its own -- it's informational, see docs/SECURITY.md
 ```
 
+List registered plugins and serve the dashboard API:
+
+```bash
+cyberjection plugins   # every registered mutator/strategy/evaluator/exporter alias
+
+pip install -e ".[api]"   # installs uvicorn
+cyberjection serve --host 0.0.0.0 --port 8000
+```
+
+Then, from `apps/dashboard/`, run `npm install && npm run dev` (or use
+`docker compose up --build` from the repo root for the full containerized
+stack) -- see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for details.
+
 ## Project layout
 
 ```
 cyberjection/
 ├── cyberjection/
-│   ├── cli/             # main.py (Typer app: run, inspect, export)
+│   ├── cli/             # main.py (Typer app: run, inspect, export, plugins, serve)
 │   ├── config/          # schema.py, loader.py
 │   ├── providers/       # base.py, litellm_provider.py
 │   ├── mutators/        # base.py, registry.py, base64_mutator.py, unicode_mutator.py,
 │   │                    # typoglycemia.py, rot13.py
-│   ├── attacks/         # base.py, prompt_injection.py, jailbreak.py, system_extraction.py,
-│   │                    # state.py, attacker.py, crescendo.py, tap.py
-│   ├── evaluators/      # base.py, ahocorasick.py, regex.py, llamaguard.py, llmjudge.py,
-│   │                    # cascade.py, regexes/*.txt
+│   ├── attacks/         # base.py, registry.py, prompt_injection.py, jailbreak.py,
+│   │                    # system_extraction.py, state.py, attacker.py, crescendo.py, tap.py
+│   ├── evaluators/      # base.py, registry.py, ahocorasick.py, regex.py, llamaguard.py,
+│   │                    # llmjudge.py, cascade.py, regexes/*.txt
 │   ├── persistence/     # models.py, sqlite.py, repository.py, resumability.py
-│   ├── reporting/       # models.py, sarif.py, exporters.py, quality_gate.py
+│   ├── reporting/       # models.py, registry.py, sarif.py, exporters.py, quality_gate.py
 │   ├── distributed/     # celery_app.py, rate_limiter.py, coordinator.py, retry.py, tasks.py
 │   ├── security/        # input_validation.py, audit_log.py, secrets_audit.py,
 │   │                    # dependency_audit.py, compliance.py
+│   ├── orchestrator/    # campaign.py
+│   ├── plugins/         # base.py, loader.py, registry.py
+│   ├── api/             # asgi.py, app.py, server.py
 │   └── utils/           # exceptions.py, context.py
+├── apps/
+│   └── dashboard/       # Vite + React + TypeScript web dashboard, Dockerfile, nginx.conf
 ├── alembic/
 │   ├── env.py
 │   ├── script.py.mako
@@ -376,6 +415,8 @@ cyberjection/
 ├── docs/
 ├── .env.example
 ├── alembic.ini
+├── Dockerfile             # API/CLI container image
+├── docker-compose.yml     # single-instance API + dashboard (+ optional redis) stack
 └── pyproject.toml
 ```
 
@@ -383,7 +424,7 @@ cyberjection/
 
 ```bash
 pytest tests/unit/ -v
-mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/
+mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/ cyberjection/plugins/ cyberjection/api/
 pytest tests/unit/ --cov=cyberjection --cov-report=term-missing
 ```
 

@@ -1,0 +1,17 @@
+.git
+.github
+.gitlab-ci.yml
+.cyberjection
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.mypy_cache
+*.egg-info
+.venv
+venv
+apps/dashboard/node_modules
+apps/dashboard/dist
+tests
+docs
+examples
+CHANGELOG.md
