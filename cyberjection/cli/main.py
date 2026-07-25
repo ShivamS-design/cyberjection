@@ -4,7 +4,10 @@ history, and re-exporting a prior run's JSON report into another format.
 Phase 8 adds `audit` (dependency/secret/target-URL auditing plus the
 compliance control report) and wires every command through the
 hash-chained audit log and the output-path/target-URL hardening checks
-from `cyberjection.security`.
+from `cyberjection.security`. Phase 9 replaces `run`'s hardcoded
+two-`Finding` stub with `cyberjection.orchestrator.execute_campaign`,
+which runs the campaign's test cases (scoped to `--target`) through the
+real Phase 1-5 attack/evaluator stack and the Phase 4 persistence layer.
 
 Built on `typer` (declarative commands) and `rich` (table/console
 rendering) per Task 6.1 of the Phase 6 design spec; both were already
@@ -26,6 +29,7 @@ from rich.table import Table
 
 from cyberjection.config.loader import load_config
 from cyberjection.config.schema import CampaignConfig, TargetConfig
+from cyberjection.orchestrator import execute_campaign
 from cyberjection.reporting import (
     Finding,
     JSONExporter,
@@ -44,6 +48,7 @@ from cyberjection.security.secrets_audit import (
     scan_paths_for_secrets,
 )
 from cyberjection.utils.exceptions import (
+    CampaignNotFoundError,
     ConfigValidationError,
     PathTraversalError,
     UnknownTargetError,
@@ -104,34 +109,41 @@ def _resolve_target(config: CampaignConfig, target_id: str) -> TargetConfig:
     )
 
 
-async def _execute_pipeline(config: CampaignConfig, target: TargetConfig) -> List[Finding]:
-    """Stub evaluation pipeline bridge.
+async def _execute_pipeline(
+    config: CampaignConfig,
+    target: TargetConfig,
+    *,
+    db_url: Optional[str] = None,
+    resume_campaign_id: Optional[str] = None,
+) -> List[Finding]:
+    """Runs `config`'s test cases through
+    `cyberjection.orchestrator.execute_campaign`, scoped to the ones that
+    target `target.id` -- matching `run_evaluation`'s own console message
+    ("starting evaluation on target: ...") and its `--target` flag's
+    documented meaning: which target within the config to evaluate, not
+    "run every test case in the config regardless of target." A
+    `CampaignConfig` can declare test cases against several targets at
+    once (running the same seed prompts across a fleet of models being a
+    normal use case), so scoping here rather than in the orchestrator
+    keeps `CampaignOrchestrator` itself target-agnostic and reusable for a
+    future "run everything" mode without this function changing shape.
 
-    Wiring `config`/`target` through the real Phase 2-5 attack/evaluator
-    machinery (mutators, single-turn strategies, the cascade evaluator,
-    Crescendo/TAP) into one orchestrated run is explicitly out of scope
-    for every phase shipped so far -- Phase 4's and Phase 5's changelogs
-    both note that no orchestrator loop exists yet, and this stub is where
-    that wiring will eventually live. It stays `async` and shaped exactly
-    like the eventual real implementation (same parameters, same return
-    type) so a later phase only has to replace this function's body, not
-    any of its callers.
+    Replaced the two-`Finding` stub every phase from 2 through 8 left in
+    place -- see this module's own history in CHANGELOG.md for why wiring
+    it was deferred that long.
     """
 
-    return [
-        Finding(
-            rule_id="CJ-001",
-            category="prompt_injection",
-            score=2.1,
-            details="Static prompt test passed.",
-        ),
-        Finding(
-            rule_id="CJ-002",
-            category="jailbreak_crescendo",
-            score=3.4,
-            details="Multi-turn escalation resisted.",
-        ),
-    ]
+    scoped_tests = [test_case for test_case in config.tests if test_case.target == target.id]
+    if not scoped_tests:
+        return []
+
+    scoped_config = config.model_copy(update={"tests": scoped_tests})
+    return await execute_campaign(
+        scoped_config,
+        db_url=db_url,
+        resume_campaign_id=resume_campaign_id,
+        max_concurrency=config.max_workers,
+    )
 
 
 def _render_summary_table(findings: List[Finding], gate: QualityGateResult) -> Table:
@@ -167,6 +179,18 @@ def run_evaluation(
     markdown_out: Optional[Path] = typer.Option(
         None, "--markdown-out", help="Path to save Markdown summary report"
     ),
+    db_url: Optional[str] = typer.Option(
+        None,
+        "--db-url",
+        help="Database URL for campaign persistence (defaults to the local SQLite results DB); "
+        "ignored if SQLAlchemy/aiosqlite aren't installed",
+    ),
+    resume_campaign_id: Optional[str] = typer.Option(
+        None,
+        "--resume",
+        help="Resume a previously interrupted campaign by its campaign id (see `cyberjection "
+        "inspect`) instead of starting a new one",
+    ),
 ) -> None:
     """Execute automated security evaluations against a specified target model."""
 
@@ -199,7 +223,16 @@ def run_evaluation(
     safe_markdown_out = _safe_output_path(markdown_out) if markdown_out else None
 
     effective_threshold = resolve_threshold(threshold, config.quality_gate.threshold)
-    findings = asyncio.run(_execute_pipeline(config, target))
+    try:
+        findings = asyncio.run(
+            _execute_pipeline(config, target, db_url=db_url, resume_campaign_id=resume_campaign_id)
+        )
+    except CampaignNotFoundError as exc:
+        console.print(f"[bold red]Cannot resume campaign:[/bold red] {exc}")
+        _audit_logger.log(
+            "cli.run.resume_not_found", resource=resume_campaign_id or "<none>", outcome="failure"
+        )
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
     gate = evaluate_quality_gate(findings, effective_threshold)
 
     console.print(_render_summary_table(findings, gate))
