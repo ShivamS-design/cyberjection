@@ -1,5 +1,5 @@
 """Tests for cyberjection.cli.main: argument parsing and exit-code behavior
-for the `run`, `inspect`, and `export` commands.
+for the `run`, `inspect`, `export`, `plugins`, and `serve` commands.
 
 Requires `typer`/`click`/`rich` to be importable. This sandbox has no
 network access to install the real `typer`/`rich` packages, so these run
@@ -455,3 +455,42 @@ quality_gate:
         )
         assert result.exit_code == EXIT_USAGE_ERROR
         assert not (tmp_path.parent / "escape-report.md").exists()
+
+
+class TestPluginsCommand:
+    def test_lists_builtin_aliases_by_group(self) -> None:
+        result = runner.invoke(app, ["plugins"])
+        assert result.exit_code == EXIT_OK
+        assert "base64" in result.output
+        assert "direct_prompt_injection" in result.output
+        assert "cyberjection.mutators" in result.output
+
+    def test_reports_plugin_load_failures_and_fails_the_gate(self, monkeypatch) -> None:
+        import cyberjection.cli.main as cli_main
+        from cyberjection.plugins.loader import DiscoveryResult
+        from cyberjection.utils.exceptions import PluginLoadError
+
+        async def _unused():  # pragma: no cover - never awaited, just a placeholder
+            raise NotImplementedError
+
+        def _fake_discover_plugins(**_kwargs):
+            return DiscoveryResult(
+                loaded=[], failures=[PluginLoadError("Failed to load plugin 'broken' from group 'x': boom")]
+            )
+
+        monkeypatch.setattr(cli_main, "discover_plugins", _fake_discover_plugins)
+        result = runner.invoke(app, ["plugins"])
+        assert result.exit_code == EXIT_QUALITY_GATE_FAILED
+        assert "plugin load failed" in result.output.lower()
+
+
+class TestServeCommand:
+    def test_reports_environment_error_when_uvicorn_unavailable(self) -> None:
+        # This sandbox has no network access to install uvicorn (see
+        # pyproject.toml's optional `api` extra), so `serve` should
+        # degrade the same way `inspect` does when SQLAlchemy isn't
+        # installed -- a clear environment-error exit code, not a bare
+        # ImportError traceback.
+        result = runner.invoke(app, ["serve"])
+        assert result.exit_code == EXIT_ENVIRONMENT_ERROR
+        assert "uvicorn" in result.output.lower()
