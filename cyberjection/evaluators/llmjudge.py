@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 from cyberjection.evaluators.base import BaseEvaluator, EvaluationOutcome, Verdict
+from cyberjection.evaluators.registry import register_evaluator
 
 
 class StructuredJudgeResponse(BaseModel):
@@ -29,6 +30,7 @@ class StructuredJudgeResponse(BaseModel):
     owasp_category: str = Field(default="LLM01_PROMPT_INJECTION")
 
 
+@register_evaluator("llm_judge")
 class LLMJudgeEvaluator(BaseEvaluator):
     """Tier 3: high-capability LLM-as-a-judge using structured JSON output.
 

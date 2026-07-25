@@ -13,6 +13,7 @@ import asyncio
 from typing import Any, Callable, Optional, Tuple
 
 from cyberjection.evaluators.base import BaseEvaluator, EvaluationOutcome, Verdict
+from cyberjection.evaluators.registry import register_evaluator
 
 # A classifier function takes (prompt_sent, response_text) and returns
 # (is_unsafe, confidence). This is the seam `LocalONNXGuardEvaluator` calls
@@ -22,6 +23,7 @@ ClassifierFn = Callable[[str, str], Tuple[bool, float]]
 _UNSAFE_MOCK_MARKERS = ("jailbreak_success", "unrestricted_access")
 
 
+@register_evaluator("onnx")
 class LocalONNXGuardEvaluator(BaseEvaluator):
     """Tier 2: local ONNX safety classifier (e.g. Llama Guard 3).
 

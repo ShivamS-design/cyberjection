@@ -14,6 +14,14 @@ from cyberjection.evaluators.cascade import CascadeEvaluator, tiers_invoked_for
 from cyberjection.evaluators.llamaguard import LocalONNXGuardEvaluator
 from cyberjection.evaluators.llmjudge import LLMJudgeEvaluator, StructuredJudgeResponse
 from cyberjection.evaluators.regex import RegexEvaluator
+from cyberjection.evaluators.registry import (
+    EvaluatorRegistrationError,
+    build_evaluator,
+    get_evaluator_class,
+    is_registered,
+    list_evaluator_aliases,
+    register_evaluator,
+)
 
 __all__ = [
     "BaseEvaluator",
@@ -25,4 +33,10 @@ __all__ = [
     "LLMJudgeEvaluator",
     "StructuredJudgeResponse",
     "RegexEvaluator",
+    "EvaluatorRegistrationError",
+    "build_evaluator",
+    "get_evaluator_class",
+    "is_registered",
+    "list_evaluator_aliases",
+    "register_evaluator",
 ]

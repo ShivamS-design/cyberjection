@@ -19,6 +19,7 @@ from typing import List, Optional, Pattern
 
 from cyberjection.evaluators.ahocorasick import AhoCorasick
 from cyberjection.evaluators.base import BaseEvaluator, EvaluationOutcome, Verdict
+from cyberjection.evaluators.registry import register_evaluator
 
 _REGEXES_DIR = Path(__file__).resolve().parent / "regexes"
 
@@ -69,6 +70,7 @@ def _load_pattern_lines(
     return lines or list(fallback)
 
 
+@register_evaluator("regex")
 class RegexEvaluator(BaseEvaluator):
     """Tier 1: zero-cost deterministic refusal-phrase and secret/canary
     evaluator. Runs in well under a millisecond and makes no network calls,
