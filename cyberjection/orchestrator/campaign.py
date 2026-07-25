@@ -24,15 +24,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple
 
+from cyberjection.attacks import registry as strategy_registry
 from cyberjection.attacks.attacker import AttackerAgent
 from cyberjection.attacks.base import BaseStrategy, ExecutionContext
 from cyberjection.attacks.crescendo import CrescendoEngine
-from cyberjection.attacks.jailbreak import JailbreakStrategy
-from cyberjection.attacks.prompt_injection import DirectPromptInjectionStrategy
 from cyberjection.attacks.state import AttackNode, TurnStatus, score_from_evaluation
-from cyberjection.attacks.system_extraction import SystemPromptExtractionStrategy
 from cyberjection.attacks.tap import TAPEngine
 from cyberjection.config.schema import (
     AssertionConfig,
@@ -65,22 +63,20 @@ from cyberjection.utils.exceptions import (
 
 logger = logging.getLogger("cyberjection.orchestrator.campaign")
 
-# Maps a `StrategyConfig.type` to the `BaseStrategy` subclass that executes
-# it. `jailbreak` and `jailbreak_roleplay` both resolve to the same class --
-# the former is the short form campaign authors are likely to write, the
-# latter matches `JailbreakStrategy.strategy_id` exactly (see
-# `cyberjection/attacks/jailbreak.py`) for authors who copy that value.
-_SINGLE_TURN_STRATEGIES: Dict[str, Type[BaseStrategy]] = {
-    "direct_prompt_injection": DirectPromptInjectionStrategy,
-    "jailbreak": JailbreakStrategy,
-    "jailbreak_roleplay": JailbreakStrategy,
-    "system_prompt_extraction": SystemPromptExtractionStrategy,
-}
-
+# Single-turn strategies are resolved through `cyberjection.attacks.registry`
+# rather than a hardcoded dict here: every built-in strategy
+# (`direct_prompt_injection`, `jailbreak`/`jailbreak_roleplay`,
+# `system_prompt_extraction`) self-registers under its alias when
+# `cyberjection.attacks` is imported (see that package's `__init__.py`),
+# and Phase 10's plugin loader (`cyberjection.plugins.loader`) registers
+# third-party strategies into the exact same registry at runtime -- so a
+# campaign config can reference a plugin-provided `StrategyConfig.type`
+# exactly like a built-in one, with no change needed here.
+#
 # Multi-turn engines aren't `BaseStrategy` subclasses (they own a growing
 # `ConversationContext` across many turns rather than framing-and-dispatching
 # a single prompt), so they're handled by `_run_multi_turn` rather than the
-# `_SINGLE_TURN_STRATEGIES` factory.
+# strategy registry.
 _MULTI_TURN_STRATEGY_TYPES = frozenset({"crescendo", "tap"})
 
 _DEFAULT_MAX_CONCURRENCY = 10
@@ -146,7 +142,9 @@ def _build_cascade_evaluator(assertions: List[AssertionConfig]) -> CascadeEvalua
 
 def _build_strategy(strategy_config: StrategyConfig) -> BaseStrategy:
     """Instantiates the single-turn `BaseStrategy` for
-    `strategy_config.type`, with its configured mutator pipeline built via
+    `strategy_config.type` via `cyberjection.attacks.registry` (built-in
+    aliases plus anything Phase 10's plugin loader registered at startup),
+    with its configured mutator pipeline built via
     `cyberjection.mutators.build_pipeline` (Phase 2). Raises
     `UnknownStrategyTypeError` for a `type` that is neither a registered
     single-turn alias nor one of the multi-turn engine names (`crescendo`,
@@ -154,15 +152,14 @@ def _build_strategy(strategy_config: StrategyConfig) -> BaseStrategy:
     never by this factory.
     """
 
-    cls = _SINGLE_TURN_STRATEGIES.get(strategy_config.type)
-    if cls is None:
+    if not strategy_registry.is_registered(strategy_config.type):
         raise UnknownStrategyTypeError(
             f"Unknown strategy type {strategy_config.type!r}. Known single-turn types: "
-            f"{sorted(_SINGLE_TURN_STRATEGIES)}; known multi-turn types: "
+            f"{strategy_registry.list_strategy_aliases()}; known multi-turn types: "
             f"{sorted(_MULTI_TURN_STRATEGY_TYPES)}"
         )
     pipeline = build_pipeline(strategy_config.converters)
-    return cls(mutator_pipeline=pipeline)
+    return strategy_registry.build_strategy(strategy_config.type, mutator_pipeline=pipeline)
 
 
 def _verdict_from_multi_turn(nodes: List[AttackNode]) -> Tuple[Verdict, float, str]:
@@ -344,13 +341,13 @@ class CampaignOrchestrator:
         try:
             if strategy_config.type in _MULTI_TURN_STRATEGY_TYPES:
                 outcome = await self._run_multi_turn(test_case, strategy_config, target, evaluator)
-            elif strategy_config.type in _SINGLE_TURN_STRATEGIES:
+            elif strategy_registry.is_registered(strategy_config.type):
                 outcome = await self._run_single_turn(test_case, strategy_config, target, evaluator)
             else:
                 raise UnknownStrategyTypeError(
                     f"Unknown strategy type {strategy_config.type!r} for strategy id "
                     f"{strategy_config.id!r}. Known single-turn types: "
-                    f"{sorted(_SINGLE_TURN_STRATEGIES)}; known multi-turn types: "
+                    f"{strategy_registry.list_strategy_aliases()}; known multi-turn types: "
                     f"{sorted(_MULTI_TURN_STRATEGY_TYPES)}"
                 )
         except (ProviderError, CyberjectionException) as exc:
