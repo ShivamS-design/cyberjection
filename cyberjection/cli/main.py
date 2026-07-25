@@ -8,6 +8,10 @@ from `cyberjection.security`. Phase 9 replaces `run`'s hardcoded
 two-`Finding` stub with `cyberjection.orchestrator.execute_campaign`,
 which runs the campaign's test cases (scoped to `--target`) through the
 real Phase 1-5 attack/evaluator stack and the Phase 4 persistence layer.
+Phase 10 adds `plugins` (lists every registered mutator/strategy/evaluator/
+exporter alias, discovering third-party ones via
+`cyberjection.plugins.loader`) and `serve` (runs the dashboard API from
+`cyberjection.api` under `uvicorn`, for `apps/dashboard` to talk to).
 
 Built on `typer` (declarative commands) and `rich` (table/console
 rendering) per Task 6.1 of the Phase 6 design spec; both were already
@@ -30,6 +34,7 @@ from rich.table import Table
 from cyberjection.config.loader import load_config
 from cyberjection.config.schema import CampaignConfig, TargetConfig
 from cyberjection.orchestrator import execute_campaign
+from cyberjection.plugins import discover_plugins, known_aliases_by_group
 from cyberjection.reporting import (
     Finding,
     JSONExporter,
@@ -39,6 +44,7 @@ from cyberjection.reporting import (
     evaluate_quality_gate,
     resolve_threshold,
 )
+from cyberjection.reporting import registry as exporter_registry
 from cyberjection.security.audit_log import AuditLogger
 from cyberjection.security.compliance import compliance_summary, generate_compliance_report
 from cyberjection.security.dependency_audit import evaluate_dependency_gate, run_dependency_audit
@@ -353,10 +359,17 @@ def export_report(
         SARIFReporter.export(findings, safe_output_path, threshold=threshold)
     elif output_format == "markdown":
         MarkdownExporter.export(findings, safe_output_path, threshold=threshold)
+    elif exporter_registry.is_registered(output_format):
+        # A plugin-registered format (see `cyberjection.plugins.loader` and
+        # the ``cyberjection.exporters`` entry-point group) -- not one of
+        # the two built-ins handled above, but discovered and registered
+        # the same way at process startup.
+        exporter_cls = exporter_registry.get_exporter_class(output_format)
+        exporter_cls.export(findings, safe_output_path, threshold=threshold)
     else:
+        known = ", ".join(sorted({"sarif", "markdown"} | set(exporter_registry.list_exporter_aliases())))
         console.print(
-            f"[bold red]Unsupported format:[/bold red] '{output_format}' "
-            "(expected 'sarif' or 'markdown')"
+            f"[bold red]Unsupported format:[/bold red] '{output_format}' (known formats: {known})"
         )
         _audit_logger.log("cli.export.unsupported_format", resource=output_format, outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
@@ -533,6 +546,81 @@ def run_audit(
     if not overall_ok:
         raise typer.Exit(code=EXIT_QUALITY_GATE_FAILED)
     raise typer.Exit(code=EXIT_OK)
+
+
+@app.command("plugins")
+def list_plugins() -> None:
+    """List every registered mutator/strategy/evaluator/exporter alias,
+    including third-party plugins discovered via `cyberjection.plugins`'s
+    entry-point groups (``cyberjection.mutators``, ``cyberjection.strategies``,
+    ``cyberjection.evaluators``, ``cyberjection.exporters``).
+
+    Discovery is best-effort: a plugin that fails to load is reported in
+    its own section rather than aborting the whole listing (see
+    `cyberjection.plugins.loader`'s module docstring).
+    """
+
+    _audit_logger.log("cli.plugins.invoked")
+
+    discovery = discover_plugins()
+    for failure in discovery.failures:
+        console.print(f"[bold red]Plugin load failed:[/bold red] {failure}")
+
+    aliases_by_group = known_aliases_by_group()
+    table = Table(title="Registered Plugins")
+    table.add_column("Group", style="cyan")
+    table.add_column("Aliases", style="magenta")
+    for group in sorted(aliases_by_group):
+        aliases = aliases_by_group[group]
+        table.add_row(group, ", ".join(aliases) if aliases else "[dim]none[/dim]")
+    console.print(table)
+
+    if discovery.loaded:
+        console.print(
+            f"[bold green]{len(discovery.loaded)} third-party plugin(s) discovered "
+            "and registered this run.[/bold green]"
+        )
+
+    _audit_logger.log(
+        "cli.plugins.completed",
+        outcome="pass" if not discovery.failures else "partial",
+        metadata={"discovered": len(discovery.loaded), "failures": len(discovery.failures)},
+    )
+    if discovery.failures:
+        raise typer.Exit(code=EXIT_QUALITY_GATE_FAILED)
+    raise typer.Exit(code=EXIT_OK)
+
+
+@app.command("serve")
+def serve_dashboard_api(
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind the dashboard API to"),
+    port: int = typer.Option(8000, "--port", help="Port to bind the dashboard API to"),
+    db_url: Optional[str] = typer.Option(
+        None,
+        "--db-url",
+        help="Database URL the API reads campaign history from (defaults to the local SQLite "
+        "results DB); ignored if SQLAlchemy/aiosqlite aren't installed",
+    ),
+) -> None:
+    """Serve the Phase 10 dashboard REST API (`cyberjection.api`) for
+    `apps/dashboard` -- or any other HTTP client -- to consume.
+
+    Requires `uvicorn` (the optional `api` extra: `pip install
+    cyberjection[api]`); building the API application itself has no such
+    requirement, only actually serving HTTP connections over a socket
+    does. Blocks until interrupted.
+    """
+
+    from cyberjection.api.server import UvicornUnavailableError, run_server
+
+    _audit_logger.log("cli.serve.invoked", metadata={"host": host, "port": port})
+    console.print(f"[bold blue]Cyberjection dashboard API[/bold blue] starting on {host}:{port}")
+    try:
+        run_server(host=host, port=port, db_url=db_url)
+    except UvicornUnavailableError as exc:
+        console.print(f"[bold red]Cannot start server:[/bold red] {exc}")
+        _audit_logger.log("cli.serve.unavailable", outcome="failure")
+        raise typer.Exit(code=EXIT_ENVIRONMENT_ERROR)
 
 
 if __name__ == "__main__":
