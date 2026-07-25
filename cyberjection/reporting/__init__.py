@@ -13,6 +13,13 @@ from __future__ import annotations
 from cyberjection.reporting.exporters import JSONExporter, MarkdownExporter
 from cyberjection.reporting.models import Finding, QualityGateResult
 from cyberjection.reporting.quality_gate import evaluate_quality_gate, resolve_threshold
+from cyberjection.reporting.registry import (
+    ExporterRegistrationError,
+    get_exporter_class,
+    is_registered,
+    list_exporter_aliases,
+    register_exporter,
+)
 from cyberjection.reporting.sarif import SARIFReporter
 
 __all__ = [
@@ -23,4 +30,9 @@ __all__ = [
     "MarkdownExporter",
     "evaluate_quality_gate",
     "resolve_threshold",
+    "ExporterRegistrationError",
+    "get_exporter_class",
+    "is_registered",
+    "list_exporter_aliases",
+    "register_exporter",
 ]

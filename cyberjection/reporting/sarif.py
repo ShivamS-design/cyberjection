@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Dict, List
 
 from cyberjection.reporting.models import Finding
+from cyberjection.reporting.registry import register_exporter
 
 SARIF_SCHEMA_URI = (
     "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json"
 )
 
 
+@register_exporter("sarif")
 class SARIFReporter:
     """Generates standardized SARIF v2.1.0 reports for enterprise security
     pipeline consumption.

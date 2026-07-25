@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List
 
 from cyberjection.reporting.models import Finding
+from cyberjection.reporting.registry import register_exporter
 
 
 def _summary(findings: List[Finding], threshold: float) -> dict:
@@ -31,6 +32,7 @@ def _summary(findings: List[Finding], threshold: float) -> dict:
     }
 
 
+@register_exporter("json")
 class JSONExporter:
     """Machine-readable JSON audit log: the full finding list plus a
     summary block, suitable for ingestion by a SIEM or a downstream
@@ -52,6 +54,7 @@ class JSONExporter:
             handle.write("\n")
 
 
+@register_exporter("markdown")
 class MarkdownExporter:
     """Executive Markdown summary: a short pass/fail header plus a
     per-finding table, meant to be pasted into a pull request comment or
