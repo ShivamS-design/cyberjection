@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Optional
 
 from cyberjection.attacks.base import BaseStrategy, ExecutionContext, SingleTurnResult
+from cyberjection.attacks.registry import register_strategy
 from cyberjection.mutators.base import MutatorPipeline
 from cyberjection.providers.litellm_provider import LiteLLMTarget
 
@@ -35,6 +36,8 @@ ROLEPLAY_PERSONAS = {
 _PERSONA_ORDER = ["developer_mode", "dan", "vm_simulation"]
 
 
+@register_strategy("jailbreak")
+@register_strategy("jailbreak_roleplay")
 class JailbreakStrategy(BaseStrategy):
     """Executes single-turn jailbreak attacks by wrapping the seed prompt in
     a persona/roleplay frame designed to displace the target's default

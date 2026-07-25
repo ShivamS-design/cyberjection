@@ -20,16 +20,30 @@ from __future__ import annotations
 from cyberjection.attacks.attacker import AttackerAgent, AttackerResponse
 from cyberjection.attacks.base import BaseStrategy, ExecutionContext, SingleTurnResult
 from cyberjection.attacks.crescendo import CrescendoEngine
-from cyberjection.attacks.jailbreak import JailbreakStrategy
-from cyberjection.attacks.prompt_injection import DirectPromptInjectionStrategy
+from cyberjection.attacks.registry import (
+    StrategyRegistrationError,
+    build_strategy,
+    get_strategy_class,
+    is_registered,
+    list_strategy_aliases,
+    register_strategy,
+)
 from cyberjection.attacks.state import (
     AttackNode,
     ConversationContext,
     TurnStatus,
     score_from_evaluation,
 )
-from cyberjection.attacks.system_extraction import SystemPromptExtractionStrategy
 from cyberjection.attacks.tap import TAPEngine
+
+# Importing each strategy module below runs its `@register_strategy(...)`
+# decorator as a side effect (see cyberjection.attacks.registry), so any
+# code that imports the `cyberjection.attacks` package -- directly or via
+# a submodule, since Python always initializes a parent package first --
+# is guaranteed to see every built-in strategy already registered.
+from cyberjection.attacks.jailbreak import JailbreakStrategy
+from cyberjection.attacks.prompt_injection import DirectPromptInjectionStrategy
+from cyberjection.attacks.system_extraction import SystemPromptExtractionStrategy
 
 __all__ = [
     "BaseStrategy",
@@ -46,4 +60,10 @@ __all__ = [
     "AttackerResponse",
     "CrescendoEngine",
     "TAPEngine",
+    "StrategyRegistrationError",
+    "build_strategy",
+    "get_strategy_class",
+    "is_registered",
+    "list_strategy_aliases",
+    "register_strategy",
 ]

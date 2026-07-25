@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Optional
 
 from cyberjection.attacks.base import BaseStrategy, ExecutionContext, SingleTurnResult
+from cyberjection.attacks.registry import register_strategy
 from cyberjection.mutators.base import MutatorPipeline
 from cyberjection.providers.litellm_provider import LiteLLMTarget
 
@@ -32,6 +33,7 @@ EXTRACTION_PROBES = [
 ]
 
 
+@register_strategy("system_prompt_extraction")
 class SystemPromptExtractionStrategy(BaseStrategy):
     """Executes single-turn system-prompt extraction probes: targeted
     requests engineered to make the model disclose its hidden system
