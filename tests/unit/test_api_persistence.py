@@ -80,6 +80,36 @@ async def seeded_app():
         await manager.close()
 
 
+@pytest.fixture
+async def seeded_app_with_metrics():
+    """Same seeding as `seeded_app`, plus a `MetricModel` row via
+    `upsert_metrics` -- exists so at least one test exercises
+    `_test_detail`'s `metrics is not None` branch, which `seeded_app`
+    alone never reaches."""
+
+    manager = DatabaseManager.in_memory()
+    await manager.init_db()
+    async with manager.session() as session:
+        repo = CampaignRepository(session)
+        campaign = await repo.create_campaign("phase-10-metrics-campaign")
+        test = await repo.create_test(campaign.id, "target-1", "direct_prompt_injection", "seed prompt")
+        await repo.record_turn(test.id, 1, "seed prompt", "response text", 12.5)
+        await repo.update_test_outcome(test.id, "FAIL", 8.5)
+        await repo.upsert_metrics(
+            test.id,
+            prompt_tokens=120,
+            completion_tokens=45,
+            total_cost=0.0033,
+            judge_tier_used=2,
+        )
+
+    app = build_app(manager=manager)
+    try:
+        yield app, campaign.id, test.id
+    finally:
+        await manager.close()
+
+
 class TestCampaignEndpointsWithDatabase:
     async def test_list_campaigns_returns_the_seeded_campaign(self, seeded_app) -> None:
         app, campaign_id, _test_id = seeded_app
@@ -100,7 +130,7 @@ class TestCampaignEndpointsWithDatabase:
         assert status == 404
         assert body["error"] == "not_found"
 
-    async def test_get_test_includes_turns_and_metrics(self, seeded_app) -> None:
+    async def test_get_test_includes_turns(self, seeded_app) -> None:
         app, campaign_id, test_id = seeded_app
         status, body = await _call_asgi_app(app, "GET", f"/api/campaigns/{campaign_id}/tests/{test_id}")
         assert status == 200
@@ -109,6 +139,45 @@ class TestCampaignEndpointsWithDatabase:
         assert len(body["turns"]) == 1
         assert body["turns"][0]["prompt"] == "seed prompt"
         assert body["turns"][0]["response"] == "response text"
+
+    async def test_get_test_without_a_metrics_row_has_null_metrics(self, seeded_app) -> None:
+        """`seeded_app` never calls `upsert_metrics`, so this test's
+        `MetricModel` relationship is empty. Regression test for the bug
+        `get_test_with_history` had for most of Phase 10: its query
+        eager-loaded `turns`/`findings` but not `metrics`, so
+        `_test_detail`'s `test.metrics` access triggered an implicit lazy
+        load under `AsyncSession` -- which raises (`MissingGreenlet`)
+        rather than returning `None` -- turning this into a 500 regardless
+        of whether the test actually had a metrics row. `_test_detail`
+        always includes a `metrics` key (the dashboard's `TestDetail`
+        TypeScript type likewise declares it as `MetricDetail | null`,
+        never an optional/absent property), so the fixed, eager-loaded
+        `None` case should serialize to a null `metrics` value rather than
+        crash or get skipped."""
+
+        app, campaign_id, test_id = seeded_app
+        status, body = await _call_asgi_app(app, "GET", f"/api/campaigns/{campaign_id}/tests/{test_id}")
+        assert status == 200
+        assert "metrics" in body
+        assert body["metrics"] is None
+
+    async def test_get_test_with_a_metrics_row_includes_metrics(self, seeded_app_with_metrics) -> None:
+        """Companion to the omits-the-key test above: covers the other
+        branch of `_test_detail`'s `if test.metrics is not None`, which the
+        original (pre-fix) bug report never actually exercised -- the test
+        it was named after (`test_get_test_includes_turns_and_metrics`)
+        never called `upsert_metrics` at all, so it only ever tested the
+        `None` path by accident."""
+
+        app, campaign_id, test_id = seeded_app_with_metrics
+        status, body = await _call_asgi_app(app, "GET", f"/api/campaigns/{campaign_id}/tests/{test_id}")
+        assert status == 200
+        assert body["metrics"] == {
+            "prompt_tokens": 120,
+            "completion_tokens": 45,
+            "total_cost": 0.0033,
+            "judge_tier_used": 2,
+        }
 
     async def test_get_test_under_wrong_campaign_returns_404(self, seeded_app) -> None:
         app, _campaign_id, test_id = seeded_app

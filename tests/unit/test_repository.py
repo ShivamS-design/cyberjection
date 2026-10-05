@@ -141,6 +141,45 @@ class TestTurnsFindingsAndMetrics:
         assert updated.total_cost == 0.01
         assert updated.judge_tier_used == 3
 
+    async def test_get_test_with_history_eager_loads_metrics(self, repo: CampaignRepository) -> None:
+        """Regression test: `get_test_with_history`'s query used to eager-
+        load `turns` and `findings` but not `metrics`. Accessing an
+        un-eager-loaded relationship on an object returned by an
+        `AsyncSession` query triggers an implicit lazy load, which
+        `AsyncSession` refuses to perform inline -- it raises
+        (`MissingGreenlet: greenlet_spawn has not been called`) instead of
+        quietly fetching the row. `cyberjection.api.app._test_detail`
+        unconditionally reads `test.metrics`, so every call to
+        `GET /api/campaigns/{id}/tests/{id}` 500'd until `metrics` was
+        added to this query's `selectinload` options. This test accesses
+        `.metrics` directly on the object `get_test_with_history` returns,
+        the same way `_test_detail` does, so a regression here fails loudly
+        instead of only surfacing through the API layer."""
+
+        campaign = await repo.create_campaign("c1")
+        test = await repo.create_test(campaign.id, "target-a", "s", "p1")
+        await repo.upsert_metrics(test.id, prompt_tokens=10, completion_tokens=5, total_cost=0.002)
+
+        fetched = await repo.get_test_with_history(test.id)
+        assert fetched.metrics is not None
+        assert fetched.metrics.prompt_tokens == 10
+        assert fetched.metrics.completion_tokens == 5
+
+    async def test_get_test_with_history_metrics_is_none_without_a_metrics_row(
+        self, repo: CampaignRepository
+    ) -> None:
+        """Companion to the test above: a test with no `MetricModel` row at
+        all must still eager-load cleanly to `None` rather than raising --
+        this is the exact shape `seeded_app` in `test_api_persistence.py`
+        exercises, and the one the original bug report's test accidentally
+        covered without naming it."""
+
+        campaign = await repo.create_campaign("c1")
+        test = await repo.create_test(campaign.id, "target-a", "s", "p1")
+
+        fetched = await repo.get_test_with_history(test.id)
+        assert fetched.metrics is None
+
 
 @pytest.mark.asyncio
 class TestCampaignWithTestsEagerLoad:
