@@ -15,6 +15,7 @@ runs this suite without even the shims on `sys.path`.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -31,6 +32,30 @@ from cyberjection.cli.main import (  # noqa: E402
 from cyberjection.reporting.models import Finding  # noqa: E402
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strips ANSI SGR (color/style) escape codes from captured CLI output.
+
+    Needed for help-text assertions specifically: this project's offline
+    `typer`/`rich` shims (used wherever the real packages aren't
+    installed, e.g. this sandbox) render `--help` as plain, unstyled
+    text, but the real `rich`-backed Typer help renderer (installed for
+    real in CI) syntax-highlights option names -- and does so by wrapping
+    *each* "word" of an option/flag in its own color-start/color-reset
+    pair, including between the two characters of a leading "--". That
+    splits a literal substring like "--target" into
+    "\x1b[1;36m-\x1b[0m\x1b[1;36m-target\x1b[0m" in `result.output`, so a
+    plain `"--target" in result.output` check -- which passed against the
+    unstyled offline shim -- silently fails against real rich's colored
+    output. Stripping the escape codes first makes the assertion exercise
+    the actual help *text*, independent of whether the renderer happens
+    to be coloring it.
+    """
+
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def _canned_findings():
@@ -119,9 +144,10 @@ class TestHelp:
     def test_run_help_lists_documented_flags(self) -> None:
         result = runner.invoke(app, ["run", "--help"])
         assert result.exit_code == EXIT_OK
-        assert "--config" in result.output
-        assert "--target" in result.output
-        assert "--threshold" in result.output
+        output = _strip_ansi(result.output)
+        assert "--config" in output
+        assert "--target" in output
+        assert "--threshold" in output
 
 
 class TestRunArgumentParsing:

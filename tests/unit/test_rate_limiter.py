@@ -221,8 +221,28 @@ class TestDistributedRateLimiterAcquire:
         sequence were not atomic, more than 10 could observe "capacity
         available" before any of them writes back the debited value,
         letting more than 10 succeed. Exactly 10 must succeed within the
-        short window before any refill meaningfully progresses; the rest
-        must still be waiting.
+        window before any refill meaningfully progresses; the rest must
+        still be waiting.
+
+        The per-worker timeout below is deliberately generous (not the
+        tiny ~50ms this test originally used) for a reason that only
+        showed up once this suite ran against a real Redis server in CI
+        rather than the offline in-memory double: against the double,
+        every `EVALSHA` resolves instantly in-process, so 50 concurrent
+        callers all settle within a handful of milliseconds. Against a
+        real Redis service container, each of those 50 `EVALSHA` calls is
+        a genuine round trip over a single shared connection, so they
+        queue and serialize -- 50 sequential round trips can themselves
+        take tens of milliseconds even before any bucket is exhausted,
+        and a too-tight timeout starves callers that *would* have been
+        correctly admitted, failing the test for a timing reason entirely
+        unrelated to the atomicity property it exists to check. A longer
+        timeout keeps that margin without weakening the assertion: the
+        bucket's capacity is still exactly 10, so at most 10 callers can
+        ever be admitted regardless of how long the rest are willing to
+        wait, and the 40 that lose the race still time out (the bucket
+        never refills meaningfully within this window) rather than
+        eventually succeeding.
         """
 
         limiter = DistributedRateLimiter("redis://test-rl-7/0", "anthropic", max_rpm=10, max_tpm=1_000_000)
@@ -232,7 +252,7 @@ class TestDistributedRateLimiterAcquire:
         async def worker() -> None:
             nonlocal completed
             try:
-                await asyncio.wait_for(limiter.acquire(request_cost=1), timeout=0.05)
+                await asyncio.wait_for(limiter.acquire(request_cost=1), timeout=2.0)
                 async with lock:
                     completed += 1
             except asyncio.TimeoutError:

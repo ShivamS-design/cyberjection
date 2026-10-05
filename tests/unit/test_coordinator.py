@@ -61,6 +61,15 @@ class TestBroadcastAbort:
         # without unsubscribing/closing the pubsub connection, leaking a
         # subscriber entry in the fake (and, against real Redis, a
         # server-side subscription) per listener.
+        #
+        # Checked via `PUBSUB CHANNELS` (exposed as `redis.pubsub_channels()`
+        # on the real `redis.asyncio.Redis` client) rather than reaching into
+        # a `_server`/`subscribers` attribute -- that internal was only ever
+        # present on this project's offline Redis test double and does not
+        # exist on the real client, which made this assertion raise
+        # `AttributeError: 'Redis' object has no attribute '_server'` the
+        # first time this suite ran against a real Redis server instead of
+        # the offline double.
         coord = DistributedClusterCoordinator("redis://test-coord-5/0")
         cancel_event = asyncio.Event()
         listener = asyncio.create_task(coord.listen_for_aborts(cancel_event))
@@ -68,8 +77,8 @@ class TestBroadcastAbort:
         await coord.broadcast_abort("tc-4", "cleanup check")
         await asyncio.wait_for(listener, timeout=1.0)
 
-        remaining = coord.redis._server.subscribers.get(coord.abort_channel, [])
-        assert remaining == []
+        remaining_channels = await coord.redis.pubsub_channels()
+        assert coord.abort_channel not in remaining_channels
 
 
 @pytest.mark.asyncio
