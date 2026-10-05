@@ -98,12 +98,19 @@ def _call_task(target_id: str, payload: str, provider_url: str, **kwargs):
 
     retries = 0
     while True:
-        result = tasks_mod.execute_eval_turn_task.apply(
-            args=(target_id, payload, provider_url), kwargs=kwargs, retries=retries
-        )
         try:
+            result = tasks_mod.execute_eval_turn_task.apply(
+                args=(target_id, payload, provider_url), kwargs=kwargs, retries=retries
+            )
             return result.get()
         except Retry:
+            # Real Celery's `Task.apply()` lets a `Retry` raised by the
+            # task body propagate directly out of `.apply()` itself
+            # (`Retry` is retry control-flow, not an ordinary task
+            # failure `task_eager_propagates`/`EagerResult.get()` are
+            # about) -- it is never packaged into the returned
+            # `EagerResult`, so this `try` has to wrap the `.apply()`
+            # call itself, not just `.get()`.
             retries += 1
 
 
