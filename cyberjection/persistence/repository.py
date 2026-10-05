@@ -154,10 +154,27 @@ class CampaignRepository:
         await self.session.commit()
 
     async def get_test_with_history(self, test_id: str) -> Optional[TestModel]:
+        """Eager-loads every relationship `cyberjection.api.app._test_detail`
+        serializes (`turns`, `findings`, and the one-to-one `metrics`).
+        `metrics` was missing from this list for most of Phase 10: under an
+        `AsyncSession`, touching an un-eager-loaded relationship attribute
+        triggers an implicit lazy load, which `AsyncSession` refuses to do
+        inline (`MissingGreenlet: greenlet_spawn has not been called`) --
+        so `GET /api/campaigns/{id}/tests/{id}` 500'd for any test whose
+        `_test_detail()` call reached the `test.metrics` access, including
+        one with no metrics row at all. `selectinload` on a `uselist=False`
+        one-to-one relationship still works correctly and returns `None`
+        when no `MetricModel` row exists, which `_test_detail` already
+        handles via its own `if test.metrics is not None` check."""
+
         stmt = (
             select(TestModel)
             .where(TestModel.id == test_id)
-            .options(selectinload(TestModel.turns), selectinload(TestModel.findings))
+            .options(
+                selectinload(TestModel.turns),
+                selectinload(TestModel.findings),
+                selectinload(TestModel.metrics),
+            )
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
