@@ -29,7 +29,54 @@ import pytest
 from celery.exceptions import MaxRetriesExceededError
 
 import cyberjection.distributed.tasks as tasks_mod
+from cyberjection.distributed.celery_app import celery_app
 from cyberjection.distributed.retry import DEAD_LETTER_QUEUE_KEY
+
+
+@pytest.fixture(autouse=True)
+def _eager_celery():
+    """Makes `self.retry(...)` inside a directly-called task behave the
+    way this module's own docstring documents ("with real Celery's
+    `task_always_eager` test mode" direct calls are "equivalent" to
+    `.delay()`/`.apply_async()`).
+
+    That assumption was never actually wired up: `celery_app.py`
+    deliberately leaves `task_always_eager` unset (correctly -- a real
+    deployment must not run tasks inline on whatever process enqueued
+    them), so nothing in this test suite ever set it either. Against
+    this project's own offline Celery test double, `Task.retry()` is
+    implemented to always behave as if eager (that's the whole point of
+    the double, documented in its own module), so every test here passed
+    regardless. Against genuine Celery in CI, calling a bound task
+    function directly -- not through `.apply()`/`.apply_async()` -- means
+    `self.request` is an empty/default context with no real worker behind
+    it; real Celery's `Task.retry()` detects it isn't running inside an
+    actual (or eager) task execution and simply re-raises the original
+    exception instead of raising `Retry`, so the retry loop this module's
+    `execute_eval_turn_task` relies on (catching `Retry` via
+    `MaxRetriesExceededError` after retries are exhausted) never
+    triggers -- the very first injected failure propagates straight out,
+    which is exactly the `ConnectionError`/`TimeoutError` failures this
+    fixture fixes.
+
+    `task_always_eager=True` (plus `task_eager_propagates=True`, so an
+    exception from an eagerly-run task raises instead of silently landing
+    in the result object) makes real Celery route `self.retry()` through
+    its proper eager-task machinery, which is what actually exercises the
+    retry/backoff/dead-letter path this suite is testing. Scoped to this
+    fixture (reset after each test) rather than set globally in
+    `celery_app.py`, so production configuration is untouched.
+    """
+
+    original_eager = celery_app.conf.task_always_eager
+    original_propagates = celery_app.conf.task_eager_propagates
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_eager_propagates = True
+    try:
+        yield
+    finally:
+        celery_app.conf.task_always_eager = original_eager
+        celery_app.conf.task_eager_propagates = original_propagates
 
 
 def _install_failing_stub(monkeypatch: pytest.MonkeyPatch, exc_factory, max_failures: int = 10**9) -> dict:
