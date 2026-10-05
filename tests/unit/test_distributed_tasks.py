@@ -4,12 +4,29 @@ Requires the `celery` and `redis` packages -- see `test_rate_limiter.py`'s
 module docstring for how these resolve in a real deployment vs. in the
 offline sandbox this suite was hard-tested in.
 
-Task functions are called directly rather than through `.delay()` /
-`.apply_async()`: with the offline `celery` shim (and with real Celery's
-`task_always_eager` test mode) these are equivalent, since there's no
-real broker in either case, and calling directly keeps the return value
-and any raised exception right at the call site instead of behind a
-result-backend lookup.
+Tasks are invoked via `.apply(args=..., kwargs=...).get()` (through the
+`_call_task` helper below) rather than by calling the task object
+directly as a plain function. An earlier draft of this suite called the
+task directly, on the theory that "with the offline celery shim (and
+with real Celery's task_always_eager test mode) these are equivalent,
+since there's no real broker in either case" -- that held against this
+project's own offline Celery test double (whose `Task.retry()` always
+loops, full stop), but turned out to be wrong against genuine Celery:
+real Celery's `Task.retry()` specifically detects a *directly*-called
+task (`request.called_directly`, true only when nothing -- no worker, no
+`.apply()`/`.apply_async()` -- sits between the caller and the task
+function) and, in that case, immediately re-raises the original
+exception instead of looping, since there is no real request context to
+schedule a retry against. That silently skipped this module's entire
+retry/backoff/dead-letter code path in CI, where every retry test failed
+with the *first* injected exception instead of exercising retries at
+all. `.apply(...)` is what real Celery itself uses to run a task
+synchronously with a proper (non-"called-directly") execution context --
+it's the officially supported way to unit-test a Celery task's body,
+including its retry logic, without a real worker or broker -- so
+`.retry()` correctly loops inside it both offline (against this
+project's own Celery double, which implements `.apply()` the same way)
+and for real.
 
 Every test here calls the task from a *synchronous* test function (not
 `async def`). The task body itself calls `asyncio.run(...)` internally
@@ -35,37 +52,14 @@ from cyberjection.distributed.retry import DEAD_LETTER_QUEUE_KEY
 
 @pytest.fixture(autouse=True)
 def _eager_celery():
-    """Makes `self.retry(...)` inside a directly-called task behave the
-    way this module's own docstring documents ("with real Celery's
-    `task_always_eager` test mode" direct calls are "equivalent" to
-    `.delay()`/`.apply_async()`).
-
-    That assumption was never actually wired up: `celery_app.py`
-    deliberately leaves `task_always_eager` unset (correctly -- a real
-    deployment must not run tasks inline on whatever process enqueued
-    them), so nothing in this test suite ever set it either. Against
-    this project's own offline Celery test double, `Task.retry()` is
-    implemented to always behave as if eager (that's the whole point of
-    the double, documented in its own module), so every test here passed
-    regardless. Against genuine Celery in CI, calling a bound task
-    function directly -- not through `.apply()`/`.apply_async()` -- means
-    `self.request` is an empty/default context with no real worker behind
-    it; real Celery's `Task.retry()` detects it isn't running inside an
-    actual (or eager) task execution and simply re-raises the original
-    exception instead of raising `Retry`, so the retry loop this module's
-    `execute_eval_turn_task` relies on (catching `Retry` via
-    `MaxRetriesExceededError` after retries are exhausted) never
-    triggers -- the very first injected failure propagates straight out,
-    which is exactly the `ConnectionError`/`TimeoutError` failures this
-    fixture fixes.
-
-    `task_always_eager=True` (plus `task_eager_propagates=True`, so an
-    exception from an eagerly-run task raises instead of silently landing
-    in the result object) makes real Celery route `self.retry()` through
-    its proper eager-task machinery, which is what actually exercises the
-    retry/backoff/dead-letter path this suite is testing. Scoped to this
-    fixture (reset after each test) rather than set globally in
-    `celery_app.py`, so production configuration is untouched.
+    """Standard practice for unit-testing Celery tasks without a real
+    broker/worker: `task_always_eager=True` (plus `task_eager_propagates`,
+    so an exception from the task raises through `.get()` instead of
+    silently landing in the result object) is what `.apply()` is
+    documented to be used alongside. Scoped to this fixture (reset after
+    each test) rather than set globally in `celery_app.py`, so production
+    configuration -- which must *not* run tasks inline on whatever
+    process enqueued them -- is untouched.
     """
 
     original_eager = celery_app.conf.task_always_eager
@@ -77,6 +71,19 @@ def _eager_celery():
     finally:
         celery_app.conf.task_always_eager = original_eager
         celery_app.conf.task_eager_propagates = original_propagates
+
+
+def _call_task(target_id: str, payload: str, provider_url: str, **kwargs):
+    """Runs `execute_eval_turn_task` through `.apply(...).get()` rather
+    than calling it as a plain function -- see this module's own
+    docstring for why that distinction is the difference between
+    `self.retry()` actually retrying and it immediately re-raising the
+    first injected failure. Centralized here so every test exercises the
+    task the same, real-Celery-correct way."""
+
+    return tasks_mod.execute_eval_turn_task.apply(
+        args=(target_id, payload, provider_url), kwargs=kwargs
+    ).get()
 
 
 def _install_failing_stub(monkeypatch: pytest.MonkeyPatch, exc_factory, max_failures: int = 10**9) -> dict:
@@ -99,34 +106,32 @@ def _install_failing_stub(monkeypatch: pytest.MonkeyPatch, exc_factory, max_fail
 
 class TestExecuteEvalTurnTaskSuccess:
     def test_successful_task_returns_completed_status(self) -> None:
-        result = tasks_mod.execute_eval_turn_task("target-success-1", "payload", "http://provider.invalid")
+        result = _call_task("target-success-1", "payload", "http://provider.invalid")
         assert result["status"] == "COMPLETED"
         assert result["target_id"] == "target-success-1"
 
     def test_result_includes_a_task_id(self) -> None:
-        result = tasks_mod.execute_eval_turn_task("target-success-2", "payload", "http://provider.invalid")
+        result = _call_task("target-success-2", "payload", "http://provider.invalid")
         assert isinstance(result["task_id"], str) and result["task_id"]
 
     def test_respects_configured_rate_limit(self) -> None:
         # max_rpm=1 with two back-to-back calls must not error -- the
         # second call blocks on the limiter instead of failing, and the
         # task still completes successfully once admitted.
-        r1 = tasks_mod.execute_eval_turn_task(
-            "target-rl-shared", "payload", "http://provider.invalid", max_rpm=1, max_tpm=90_000
-        )
+        r1 = _call_task("target-rl-shared", "payload", "http://provider.invalid", max_rpm=1, max_tpm=90_000)
         assert r1["status"] == "COMPLETED"
 
 
 class TestExecuteEvalTurnTaskRetry:
     def test_transient_failure_is_retried_and_eventually_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = _install_failing_stub(monkeypatch, lambda: ConnectionError("transient"), max_failures=2)
-        result = tasks_mod.execute_eval_turn_task("target-retry-1", "payload", "http://provider.invalid")
+        result = _call_task("target-retry-1", "payload", "http://provider.invalid")
         assert result["status"] == "COMPLETED"
         assert calls["n"] == 3  # failed twice, succeeded on the 3rd attempt
 
     def test_retry_uses_exponential_backoff_countdowns(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_failing_stub(monkeypatch, lambda: TimeoutError("slow provider"), max_failures=2)
-        tasks_mod.execute_eval_turn_task("target-retry-2", "payload", "http://provider.invalid")
+        _call_task("target-retry-2", "payload", "http://provider.invalid")
         # The task doesn't expose its TaskContext to the caller directly,
         # but the celery shim's retry loop only re-invokes the function
         # when self.retry() raised Retry (not some other exception), and
@@ -138,12 +143,12 @@ class TestExecuteEvalTurnTaskRetry:
     def test_exhausting_retries_raises_max_retries_exceeded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_failing_stub(monkeypatch, lambda: ConnectionError("always fails"))
         with pytest.raises(MaxRetriesExceededError):
-            tasks_mod.execute_eval_turn_task("target-retry-3", "payload", "http://provider.invalid")
+            _call_task("target-retry-3", "payload", "http://provider.invalid")
 
     def test_retries_are_bounded_by_max_retries_constant(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = _install_failing_stub(monkeypatch, lambda: ConnectionError("always fails"))
         with pytest.raises(MaxRetriesExceededError):
-            tasks_mod.execute_eval_turn_task("target-retry-4", "payload", "http://provider.invalid")
+            _call_task("target-retry-4", "payload", "http://provider.invalid")
         # 1 initial attempt + MAX_RETRIES retries
         assert calls["n"] == tasks_mod.MAX_RETRIES + 1
 
@@ -167,7 +172,7 @@ class TestExecuteEvalTurnTaskDeadLetter:
         _install_failing_stub(monkeypatch, lambda: ConnectionError("permanently down"))
         target_id = "target-dlq-1"
         with pytest.raises(MaxRetriesExceededError):
-            tasks_mod.execute_eval_turn_task(target_id, "the payload", "http://provider.invalid")
+            _call_task(target_id, "the payload", "http://provider.invalid")
 
         entries = asyncio.run(self._read_dlq_for_target(target_id))
         assert len(entries) == 1
@@ -178,7 +183,7 @@ class TestExecuteEvalTurnTaskDeadLetter:
 
     def test_successful_task_never_touches_dead_letter_queue(self, monkeypatch: pytest.MonkeyPatch) -> None:
         target_id = "target-dlq-2"
-        tasks_mod.execute_eval_turn_task(target_id, "payload", "http://provider.invalid")
+        _call_task(target_id, "payload", "http://provider.invalid")
 
         entries = asyncio.run(self._read_dlq_for_target(target_id))
         assert entries == []
