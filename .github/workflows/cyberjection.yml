@@ -20,6 +20,29 @@ on:
 jobs:
   security-eval:
     runs-on: ubuntu-latest
+    # `upload-sarif` needs write access to the Security tab's code-scanning
+    # alerts -- without this, the step 403s on any run triggered by a fork
+    # PR or a repo with the default (more restrictive) `GITHUB_TOKEN` perms.
+    permissions:
+      contents: read
+      security-events: write
+    services:
+      # Backs `cyberjection.distributed.{rate_limiter,coordinator}`'s real
+      # `redis.asyncio` client for the unit suite's Pub/Sub and token-bucket
+      # tests (as opposed to the offline in-memory double those modules'
+      # own test files document as the *local* dev/sandbox fallback).
+      # `ports: ["6379:6379"]` publishes the container's port onto the
+      # runner's own `localhost`, which is what every hostname below is
+      # aliased to.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -33,6 +56,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+
+      - name: Alias per-test Redis hostnames to localhost
+        # test_rate_limiter.py / test_coordinator.py deliberately construct
+        # each `DistributedRateLimiter` / `DistributedClusterCoordinator`
+        # against a distinct fake hostname (redis://test-rl-1/0 ..
+        # test-rl-9/0, redis://test-coord-1/0 .. test-coord-10/0) so that
+        # tests run concurrently against a shared local dev Redis don't see
+        # each other's keys/channels. The real `redis` package resolves
+        # these as DNS names, which don't exist -- aliasing them to
+        # 127.0.0.1 here (where the `redis:` service above is published)
+        # keeps that per-test isolation design (distinct Redis *logical*
+        # connections, same server) working against a genuine Redis server
+        # in CI instead of only against the offline in-memory double.
+        run: |
+          for host in test-rl-1 test-rl-2 test-rl-3 test-rl-4 test-rl-5 test-rl-6 test-rl-7 test-rl-8 test-rl-9 \
+                      test-coord-1 test-coord-2 test-coord-3 test-coord-4 test-coord-5 test-coord-6 test-coord-7 test-coord-8 test-coord-9 test-coord-10; do
+            echo "127.0.0.1 $host" | sudo tee -a /etc/hosts
+          done
 
       - name: Run unit test suite
         run: pytest tests/unit/ -v
@@ -87,10 +128,21 @@ jobs:
           pip install -e ".[dev,security]"
 
       - name: Run dependency + secret audit
+        # `--path` restricts the secrets scan to the actual source tree.
+        # Without it, `cyberjection audit --secrets` defaults to scanning
+        # the whole checked-out repo -- including tests/unit/test_*.py,
+        # which deliberately contains synthetic credential-shaped strings
+        # (fake AWS access keys, a fake Slack token, etc.) to test the
+        # scanner's own pattern matching. Scanning those files in CI made
+        # every single run of this job fail on findings that are test
+        # fixtures, not leaked secrets.
         run: |
           cyberjection audit \
             --deps \
             --secrets \
+            --path cyberjection \
+            --path examples \
+            --path apps \
             --fail-on-unavailable \
             --report hardening-report.md
 
