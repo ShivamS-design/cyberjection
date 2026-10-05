@@ -139,6 +139,35 @@ def execute_eval_turn_task(
             )
         )
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any failure here is a retry candidate
+        # Checked *before* calling `self.retry()`, rather than relying on
+        # catching `MaxRetriesExceededError` out of that call: real
+        # Celery's `Task.retry()`, once `self.request.retries` has reached
+        # `self.max_retries`, does NOT raise `MaxRetriesExceededError` when
+        # an `exc` was passed in (which this call site always does) --
+        # it re-raises that original `exc` itself instead (per Celery's
+        # own `retry()` source: `if exc: raise_with_context(exc)`, and
+        # `MaxRetriesExceededError` is only raised when `exc` is `None`).
+        # This project's offline Celery test double originally modeled
+        # `self.retry()` as unconditionally raising
+        # `MaxRetriesExceededError` once exhausted -- which is why this
+        # `except MaxRetriesExceededError:` around `self.retry()` passed
+        # every offline test but silently never fired once this ran
+        # against genuine Celery in CI: the raw `exc` (e.g. the original
+        # `ConnectionError`) propagated straight out instead, skipping the
+        # dead-letter hand-off entirely. Deciding exhaustion ourselves,
+        # up front, makes the dead-letter path -- and the
+        # `MaxRetriesExceededError` this task promises its callers --
+        # reliable regardless of which `exc` the retry was called with.
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "task %s exhausted %s retries for target %s; routing to dead-letter queue",
+                self.request.id,
+                self.max_retries,
+                target_id,
+            )
+            asyncio.run(_dead_letter(self, target_id, payload, provider_url, exc))
+            raise MaxRetriesExceededError(str(exc)) from exc
+
         countdown = compute_backoff_delay(self.request.retries)
         logger.warning(
             "task %s failed for target %s (attempt %s): %s; retrying in %.2fs",
@@ -148,17 +177,7 @@ def execute_eval_turn_task(
             exc,
             countdown,
         )
-        try:
-            raise self.retry(exc=exc, countdown=countdown)
-        except MaxRetriesExceededError:
-            logger.error(
-                "task %s exhausted %s retries for target %s; routing to dead-letter queue",
-                self.request.id,
-                self.max_retries,
-                target_id,
-            )
-            asyncio.run(_dead_letter(self, target_id, payload, provider_url, exc))
-            raise
+        raise self.retry(exc=exc, countdown=countdown)
 
 
 async def _dead_letter(self: Any, target_id: str, payload: str, provider_url: str, exc: BaseException) -> None:
