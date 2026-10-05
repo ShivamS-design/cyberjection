@@ -4,29 +4,41 @@ Requires the `celery` and `redis` packages -- see `test_rate_limiter.py`'s
 module docstring for how these resolve in a real deployment vs. in the
 offline sandbox this suite was hard-tested in.
 
-Tasks are invoked via `.apply(args=..., kwargs=...).get()` (through the
-`_call_task` helper below) rather than by calling the task object
-directly as a plain function. An earlier draft of this suite called the
-task directly, on the theory that "with the offline celery shim (and
-with real Celery's task_always_eager test mode) these are equivalent,
-since there's no real broker in either case" -- that held against this
-project's own offline Celery test double (whose `Task.retry()` always
-loops, full stop), but turned out to be wrong against genuine Celery:
-real Celery's `Task.retry()` specifically detects a *directly*-called
-task (`request.called_directly`, true only when nothing -- no worker, no
-`.apply()`/`.apply_async()` -- sits between the caller and the task
-function) and, in that case, immediately re-raises the original
-exception instead of looping, since there is no real request context to
-schedule a retry against. That silently skipped this module's entire
-retry/backoff/dead-letter code path in CI, where every retry test failed
-with the *first* injected exception instead of exercising retries at
-all. `.apply(...)` is what real Celery itself uses to run a task
-synchronously with a proper (non-"called-directly") execution context --
-it's the officially supported way to unit-test a Celery task's body,
-including its retry logic, without a real worker or broker -- so
-`.retry()` correctly loops inside it both offline (against this
-project's own Celery double, which implements `.apply()` the same way)
-and for real.
+Tasks are invoked via the `_call_task` helper below, which drives
+`execute_eval_turn_task.apply(args=..., kwargs=..., retries=N)` in a loop
+that catches `celery.exceptions.Retry` and re-applies with `retries`
+incremented, rather than calling the task object directly as a plain
+function or trusting a single `.apply()` call to loop on its own.
+
+Two things earlier drafts of this suite got wrong, both only visible
+once this ran against genuine Celery in CI (this project's own offline
+Celery test double papers over both, since its `Task.retry()` always
+loops a single call to completion by itself):
+
+1. Calling the task directly as a plain function -- on the theory that
+   "with the offline celery shim (and with real Celery's
+   task_always_eager test mode) these are equivalent, since there's no
+   real broker in either case" -- does not work against real Celery.
+   Real `Task.retry()` detects a *directly*-called task
+   (`request.called_directly`, true whenever nothing -- no worker, no
+   `.apply()`/`.apply_async()` -- sits between the caller and the task
+   function) and immediately re-raises the original exception instead of
+   attempting to retry, since there's no real request context to
+   schedule a retry against.
+2. Calling `.apply(...)` once and expecting it to internally loop every
+   retry to completion also does not hold against real Celery: `.apply()`
+   runs the task body exactly once per call and, when the body raises
+   `celery.exceptions.Retry` (which `self.retry()` raises whenever
+   retries remain), that `Retry` propagates straight out through
+   `EagerResult.get()` rather than being caught and retried internally.
+   `Task.apply()`'s own `retries=` keyword argument is the documented
+   mechanism for a *caller* to drive that loop itself -- precisely what
+   `_call_task` does -- seeding each successive `.apply()` call's request
+   context with the incremented retry count so `self.retry()`'s own
+   `retries >= max_retries` check (and this module's dead-letter
+   hand-off once that check trips) behaves exactly as it would across a
+   real worker's successive pickups of the same task, without needing an
+   actual broker or worker process.
 
 Every test here calls the task from a *synchronous* test function (not
 `async def`). The task body itself calls `asyncio.run(...)` internally
@@ -43,7 +55,7 @@ import asyncio
 import json
 
 import pytest
-from celery.exceptions import MaxRetriesExceededError
+from celery.exceptions import MaxRetriesExceededError, Retry
 
 import cyberjection.distributed.tasks as tasks_mod
 from cyberjection.distributed.celery_app import celery_app
@@ -74,16 +86,25 @@ def _eager_celery():
 
 
 def _call_task(target_id: str, payload: str, provider_url: str, **kwargs):
-    """Runs `execute_eval_turn_task` through `.apply(...).get()` rather
-    than calling it as a plain function -- see this module's own
-    docstring for why that distinction is the difference between
-    `self.retry()` actually retrying and it immediately re-raising the
-    first injected failure. Centralized here so every test exercises the
-    task the same, real-Celery-correct way."""
+    """Runs `execute_eval_turn_task` to completion -- including every
+    retry attempt -- via repeated `.apply(..., retries=N)` calls. See
+    this module's own docstring for why neither a direct call nor a
+    single `.apply()` call is enough to exercise retries against real
+    Celery. `celery.exceptions.MaxRetriesExceededError` (raised by
+    `self.retry()` once `retries` reaches `self.max_retries`) propagates
+    out of this function exactly as it would out of a bare function call
+    or a single `.apply()` -- only a mid-sequence `Retry` is caught and
+    looped here."""
 
-    return tasks_mod.execute_eval_turn_task.apply(
-        args=(target_id, payload, provider_url), kwargs=kwargs
-    ).get()
+    retries = 0
+    while True:
+        result = tasks_mod.execute_eval_turn_task.apply(
+            args=(target_id, payload, provider_url), kwargs=kwargs, retries=retries
+        )
+        try:
+            return result.get()
+        except Retry:
+            retries += 1
 
 
 def _install_failing_stub(monkeypatch: pytest.MonkeyPatch, exc_factory, max_failures: int = 10**9) -> dict:
