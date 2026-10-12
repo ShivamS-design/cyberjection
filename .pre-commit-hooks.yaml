@@ -1,0 +1,32 @@
+# pre-commit hooks published by this repository. Use them from your
+# project's .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/ShivamS-design/cyberjection
+#       rev: v0.12.0
+#       hooks:
+#         - id: cyberjection-hubguard
+#         - id: cyberjection-local
+#           args: [--config, cyberjection.yaml, --target, local-model]
+
+- id: cyberjection-local
+  name: Cyberjection local prompt-safety check
+  description: >-
+    Fast single-turn adversarial check against a local model (Ollama, vLLM,
+    LM Studio) whenever prompts, guardrails or RAG code change. No remote
+    calls and no cost: refuses non-local targets and disables the remote judge.
+  entry: cyberjection run --local-only
+  language: python
+  pass_filenames: false
+  files: \.(ya?ml|json|txt|md|prompt|j2|jinja2?|py)$
+  stages: [pre-commit, pre-push]
+
+- id: cyberjection-hubguard
+  name: HubGuard model file scan
+  description: >-
+    Statically scans staged model files for malicious pickles, unsafe
+    SafeTensors and dangerous trust_remote_code Python. Never loads them.
+  entry: cyberjection hubguard file
+  language: python
+  files: (\.(bin|pt|pth|ckpt|pkl|pickle|joblib|dill|npy|npz|safetensors)$|(^|/)(modeling|configuration|tokenization)_[^/]*\.py$)
+  require_serial: false

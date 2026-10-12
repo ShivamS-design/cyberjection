@@ -13,7 +13,7 @@ worker consumes this task").
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 try:
     import redis.asyncio as aioredis
@@ -64,7 +64,7 @@ class DistributedClusterCoordinator:
         await self.broadcast_abort(test_case_id, reason or "evaluator verdict FAIL")
         return True
 
-    async def listen_for_aborts(self, cancel_event: Any) -> None:
+    async def listen_for_aborts(self, cancel_event: Any) -> Optional[Dict[str, Any]]:
         """Blocks, listening on the abort channel, until one abort message
         arrives, then sets `cancel_event` and returns.
 
@@ -83,12 +83,12 @@ class DistributedClusterCoordinator:
             await pubsub.subscribe(self.abort_channel)
             async for message in pubsub.listen():
                 if message["type"] == "message":
-                    data = json.loads(message["data"])
+                    data: Dict[str, Any] = json.loads(message["data"])
                     cancel_event.set()
                     return data
         finally:
             await pubsub.unsubscribe(self.abort_channel)
-            await pubsub.aclose()
+            await pubsub.aclose()  # type: ignore[no-untyped-call]
         return None
 
     async def close(self) -> None:

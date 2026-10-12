@@ -1,0 +1,19 @@
+# Keeps pinned action SHAs, Python and npm dependencies current with
+# reviewed pull requests (grouped weekly to limit noise).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      actions: {patterns: ["*"]}
+  - package-ecosystem: pip
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      python: {patterns: ["*"]}
+  - package-ecosystem: npm
+    directory: /apps/dashboard
+    schedule: {interval: weekly}
+    groups:
+      dashboard: {patterns: ["*"]}

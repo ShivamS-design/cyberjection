@@ -60,16 +60,20 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         framework=ASVS,
         title="Authentication controls",
         status=ControlStatus.PARTIAL,
-        evidence=("cyberjection/api/", "cyberjection/api/static.py", "docs/DEPLOYMENT.md"),
+        evidence=(
+            "cyberjection/api/asgi.py:ASGIApp._authorized",
+            "cyberjection/cli/main.py (serve --api-token / CYBERJECTION_API_TOKEN)",
+            "tests/unit/test_hardening_batch.py::TestApiAuth",
+            "docs/DEPLOYMENT.md",
+        ),
         notes=(
-            "Phase 10's dashboard API (cyberjection.api) introduced Cyberjection's first "
-            "network-facing surface, and it deliberately implements no authentication of its "
-            "own -- the 'single trusted team, one instance' deployment model documented in "
-            "docs/DEPLOYMENT.md puts the operator's own network perimeter/reverse proxy in "
-            "front of it instead of building a second, likely-worse auth layer inside this "
-            "project. Every endpoint is also read-only (see docs/ARCHITECTURE.md's Phase 10 "
-            "section), so the surface an unauthenticated caller can reach is bounded to "
-            "already-completed campaign history, not campaign execution."
+            "Since 0.12.0 the dashboard API supports an optional shared bearer token "
+            "(constant-time comparison; /api/health exempt), and `serve` warns when bound "
+            "beyond loopback without it. PARTIAL because there are no per-user identities, "
+            "roles or SSO: the 'single trusted team, one instance' model in docs/DEPLOYMENT.md "
+            "still expects an authenticating reverse proxy for anything wider. Every endpoint "
+            "is read-only, so the reachable surface is completed campaign history, not campaign "
+            "execution."
         ),
     ),
     ControlMapping(
@@ -116,15 +120,19 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         framework=ASVS,
         title="Log records are protected against unauthorized modification",
         status=ControlStatus.PARTIAL,
-        evidence=("cyberjection/security/audit_log.py:verify_chain",),
+        evidence=(
+            "cyberjection/security/audit_log.py:verify_chain",
+            "cyberjection/security/audit_log.py (HMAC chain via CYBERJECTION_AUDIT_KEY)",
+            "cyberjection audit --verify-log",
+        ),
         notes=(
-            "Hash-chained log entries make tampering with an existing entry "
-            "detectable via verify_chain(), but the log file itself has no "
-            "filesystem-level write protection or off-host replication -- an "
-            "attacker with delete access can still truncate and restart the "
-            "chain. Full protection needs an append-only or remote log sink, "
-            "which is deployment-environment-specific and out of this "
-            "library's scope."
+            "With CYBERJECTION_AUDIT_KEY set, entries form an HMAC-SHA256 chain that "
+            "can't be rewritten without the key, and a keyed verifier rejects downgraded "
+            "(unkeyed) entries; `cyberjection audit --verify-log` checks it. The file "
+            "itself still has no write protection or off-host replication -- an "
+            "attacker with delete access can truncate it. Full protection needs an "
+            "append-only or remote log sink, which is deployment-environment-specific "
+            "and out of this library's scope."
         ),
     ),
     ControlMapping(

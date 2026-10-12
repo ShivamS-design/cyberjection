@@ -49,10 +49,14 @@ class CascadeEvaluator:
         tier2: Optional[LocalONNXGuardEvaluator] = None,
         tier3: Optional[LLMJudgeEvaluator] = None,
         tier2_confidence_threshold: float = 0.90,
+        enable_tier3: bool = True,
     ) -> None:
         self.tier1 = tier1 or RegexEvaluator()
         self.tier2 = tier2 or LocalONNXGuardEvaluator(confidence_threshold=tier2_confidence_threshold)
         self.tier3 = tier3 or LLMJudgeEvaluator()
+        # False for `cyberjection run --local-only`: no remote judge call,
+        # so an inconclusive Tier 2 result stays UNCERTAIN.
+        self.enable_tier3 = enable_tier3
 
     async def evaluate(self, prompt_sent: str, response_text: str) -> EvaluationOutcome:
         # --- Tier 1: deterministic check (<1ms, $0.00) ---
@@ -66,5 +70,12 @@ class CascadeEvaluator:
             return t2_outcome
 
         # --- Tier 3: LLM-as-a-judge (500-2000ms, external API $) ---
+        if not self.enable_tier3:
+            return EvaluationOutcome(
+                verdict=Verdict.UNCERTAIN,
+                confidence=t2_outcome.confidence,
+                judge_tier_used=2,
+                reason="Inconclusive at Tiers 1-2; Tier 3 (remote LLM judge) is disabled in local-only mode.",
+            )
         t3_outcome = await self.tier3.evaluate(prompt_sent, response_text)
         return t3_outcome

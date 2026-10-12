@@ -141,7 +141,7 @@ class AuditLogger:
                     last_line = stripped
         if last_line is None:
             return GENESIS_HASH
-        return json.loads(last_line)["entry_hash"]
+        return str(json.loads(last_line)["entry_hash"])
 
     def read_all(self) -> Iterator[Dict[str, Any]]:
         if not self.log_path.exists():

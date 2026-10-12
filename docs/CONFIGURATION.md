@@ -37,7 +37,7 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `targets` | list of `TargetConfig` | required | Must have unique `id`s. |
 | `strategies` | list of `StrategyConfig` | `[]` | Must have unique `id`s. |
 | `tests` | list of `TestCaseConfig` | `[]` | Each `target` and `strategy` reference must match a known id. |
-| `max_cost_cap` | float | `10.0` | Hard budget ceiling in USD; must be `>= 0`. |
+| `max_cost_cap` | float | `10.0` | USD cap on measured model spend: target, attacker and judge calls. Checked before every call; `0` disables it. When reached, running tests stop, unstarted tests are reported as `budget_exceeded`, the campaign is stored as `BUDGET_EXCEEDED`, and `cyberjection run` exits `5` after writing its reports. Calls whose cost can't be determined (models missing from LiteLLM's pricing data, with no `pricing` block) are counted and reported, never charged an invented amount. |
 | `max_workers` | int | `50` | Concurrent worker cap; `1-200`. |
 | `quality_gate` | `QualityGateConfig` | see below | CI/CD pass/fail threshold (Phase 6). |
 | `hubguard` | `HubGuardConfig` | optional | Model supply-chain gate for `huggingface` targets (Phase 11); see below. |
@@ -56,6 +56,7 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `max_tokens` | int | `1024` | Must be `>= 1`. |
 | `rate_limit` | `RateLimitConfig` | see below | Per-target throughput controls. |
 | `custom_headers` | dict[str, str] | `{}` | Extra HTTP headers for custom endpoints. |
+| `pricing` | object | optional | `{input_per_million_usd, output_per_million_usd}`: explicit token pricing for self-hosted or custom models, used by `max_cost_cap`. Overrides LiteLLM's pricing data. |
 | `trust_remote_code` | bool | `false` | Declares that this Hugging Face target is loaded with `trust_remote_code=True`; rejected when `hubguard.block_remote_code` is on. |
 | `revision` | string | optional | Hub branch, tag or commit SHA that HubGuard audits (default `main`). Pin a commit SHA in production. |
 
@@ -454,6 +455,34 @@ consuming this API (campaigns list, campaign detail, test transcript
 view, plugins page). See [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for how to
 build it and serve it alongside the API with
 `cyberjection serve --dashboard-dir apps/dashboard/dist`.
+
+## Local-only checks and developer workflow (0.12.0)
+
+`cyberjection run --local-only` is a fast, zero-cost check meant for
+pre-commit hooks. The target must be a local endpoint (Ollama on its
+default port, or an `api_base` on a loopback/private address); any other
+target is refused before a prompt is sent. Only single-turn strategies run
+(multi-turn tests are reported as `skipped_local_only`), and the remote LLM
+judge is disabled, so inconclusive results stay `UNCERTAIN`.
+
+Integrations shipped in the repository:
+
+| File | Use |
+|---|---|
+| `.pre-commit-hooks.yaml` | `cyberjection-local` (prompt-safety check) and `cyberjection-hubguard` (scans staged model files) for [pre-commit](https://pre-commit.com). |
+| `action.yml` | GitHub Action: `uses: ShivamS-design/cyberjection@v0.12.0` with `command: run | hubguard-gate | hubguard-scan | audit`; uploads SARIF to code scanning. |
+| `ci/gitlab/cyberjection.gitlab-ci.yml` | GitLab CI templates (`.cyberjection-run`, `.cyberjection-hubguard`) to `include:` and `extends:`. |
+| `examples/ci/scheduled-compliance.yml` | Weekly scheduled red-team run producing an OWASP report. |
+
+The OWASP Top 10 for LLM Applications (2025) coverage report is an
+exporter: `cyberjection export --from-json results.json --format owasp-llm
+--output owasp.md`. Map tests to categories with `owasp_category`; 2023
+identifiers and keywords are accepted, and untested categories are listed
+as `NOT TESTED`.
+
+Exit codes for `cyberjection run`: `0` pass, `1` quality gate failed, `2`
+usage/config error, `3` missing runtime dependency, `4` HubGuard blocked
+the target, `5` budget cap reached (reports still written).
 
 ## HubGuard model supply-chain gate (Phase 11)
 

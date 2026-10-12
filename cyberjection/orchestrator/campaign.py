@@ -118,7 +118,7 @@ class TestOutcome:
     cost_usd: float = 0.0
 
 
-def _build_cascade_evaluator(assertions: List[AssertionConfig]) -> CascadeEvaluator:
+def _build_cascade_evaluator(assertions: List[AssertionConfig], *, local_only: bool = False) -> CascadeEvaluator:
     """Builds a `CascadeEvaluator` for a test case, threading its
     `llm-judge`-type assertion's `judge_model` / `rubric` /
     `confidence_threshold` (Phase 1's schema) through to Tier 3 -- the
@@ -132,6 +132,9 @@ def _build_cascade_evaluator(assertions: List[AssertionConfig]) -> CascadeEvalua
     """
 
     judge_assertion = next((a for a in assertions if a.type == AssertionType.LLM_JUDGE), None)
+    if local_only:
+        threshold = judge_assertion.confidence_threshold if judge_assertion else 0.90
+        return CascadeEvaluator(tier2_confidence_threshold=threshold, enable_tier3=False)
     if judge_assertion is None:
         return CascadeEvaluator()
 
@@ -263,6 +266,7 @@ class CampaignOrchestrator:
         resumability: Optional[ResumabilityManager] = None,
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
         budget: Optional[BudgetTracker] = None,
+        local_only: bool = False,
     ) -> None:
         # Wrapped so concurrent test cases never share the session at once.
         self.repository = _SerializedRepository(repository) if repository is not None else None
@@ -271,6 +275,9 @@ class CampaignOrchestrator:
         # Campaign-wide spend tracker; created from config.max_cost_cap by
         # run_campaign unless the caller supplies one.
         self.budget = budget
+        # `cyberjection run --local-only`: single-turn strategies only and no
+        # remote judge, so nothing but the (local) target is ever called.
+        self.local_only = local_only
 
     async def run_campaign(
         self, config: CampaignConfig, *, campaign_row_id: Optional[str] = None
@@ -373,9 +380,20 @@ class CampaignOrchestrator:
                 resumed_state.test_id,
             )
 
+        if self.local_only and strategy_config.type in _MULTI_TURN_STRATEGY_TYPES:
+            return Finding(
+                rule_id=f"{test_case.strategy}:{test_case.name}",
+                category="skipped_local_only",
+                score=0.0,
+                details=(
+                    f"Not run: {strategy_config.type!r} is multi-turn and needs a remote attacker model; "
+                    "run without --local-only to include it."
+                ),
+            )
+
         target_config = targets_by_id[test_case.target]
         target = LiteLLMTarget(target_config)
-        evaluator = _build_cascade_evaluator(test_case.assertions)
+        evaluator = _build_cascade_evaluator(test_case.assertions, local_only=self.local_only)
 
         test_row_id: Optional[str] = None
         if self.repository is not None and campaign_row_id:
@@ -539,6 +557,7 @@ async def execute_campaign(
     db_url: Optional[str] = None,
     resume_campaign_id: Optional[str] = None,
     max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+    local_only: bool = False,
 ) -> List[Finding]:
     """High-level entrypoint `cyberjection.cli.main._execute_pipeline`
     calls: opens the persistence layer when SQLAlchemy is installed,
@@ -562,7 +581,9 @@ async def execute_campaign(
                 f"{resume_campaign_id!r}: the persistence layer (SQLAlchemy/aiosqlite) isn't "
                 "installed in this environment, so no campaign history exists to resume from."
             )
-        orchestrator = CampaignOrchestrator(repository=None, resumability=None, max_concurrency=max_concurrency)
+        orchestrator = CampaignOrchestrator(
+            repository=None, resumability=None, max_concurrency=max_concurrency, local_only=local_only
+        )
         findings = await orchestrator.run_campaign(config)
         _raise_if_budget_exceeded(orchestrator, findings)
         return findings
@@ -590,7 +611,10 @@ async def execute_campaign(
 
             await repository.update_campaign_status(campaign_row_id, "RUNNING")
             orchestrator = CampaignOrchestrator(
-                repository=repository, resumability=resumability, max_concurrency=max_concurrency
+                repository=repository,
+                resumability=resumability,
+                max_concurrency=max_concurrency,
+                local_only=local_only,
             )
             try:
                 findings = await orchestrator.run_campaign(config, campaign_row_id=campaign_row_id)

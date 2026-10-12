@@ -17,6 +17,13 @@ controls: a VPN, an internal network, or a reverse proxy with its own
 SSO/auth in front. It is not a multi-tenant deployment model. There is no
 per-team data isolation, per-user login, or per-team rate limiting.
 
+To require a token on the API, set `CYBERJECTION_API_TOKEN` (or pass
+`--api-token`; prefer the variable, since command-line arguments are visible
+to other local users). Every `/api/` request except `/api/health` must then
+carry `Authorization: Bearer <token>`; the dashboard asks for it once and keeps
+it in the tab's `sessionStorage`. `serve` prints a warning if it is bound to a
+non-loopback address without a token.
+
 If the dashboard must be reachable beyond a trusted team's own network,
 put an authenticating reverse proxy (an OAuth2 proxy, or your cloud
 provider's identity-aware proxy) in front of it first. Do not expose
@@ -131,6 +138,8 @@ servers (see `docs/TESTING.md`).
 | `cyberjection serve --db-url` | Database URL the API reads campaign history from (same format as `cyberjection run --db-url`). Defaults to the local SQLite results DB. |
 | `--dashboard-dir` / `CYBERJECTION_DASHBOARD_DIR` | Built dashboard directory to serve on the same origin as the API. |
 | `CYBERJECTION_AUDIT_LOG` | Where `cyberjection.security.audit_log.AuditLogger` writes. Defaults to `.cyberjection/audit.jsonl` in the working directory. |
+| `CYBERJECTION_AUDIT_KEY` | Optional secret that turns the audit log into an HMAC chain; verify with `cyberjection audit --verify-log`. Keep it outside the log's host if you can. |
+| `--api-token` / `CYBERJECTION_API_TOKEN` | Optional bearer token required on `/api/*` (except `/api/health`). |
 | `CYBERJECTION_CELERY_BROKER_URL` | Redis URL for the optional distributed workers. |
 | `HF_TOKEN`, `HF_ENDPOINT` | Hugging Face credentials and endpoint for HubGuard (Phase 11). The token is only ever sent to the Hub endpoint's own host. |
 

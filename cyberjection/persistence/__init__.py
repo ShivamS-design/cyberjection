@@ -25,14 +25,14 @@ try:
 
     _SQLALCHEMY_AVAILABLE = True
 except ImportError:  # pragma: no cover - only without sqlalchemy installed
-    Base = None
-    CampaignModel = None
-    FindingModel = None
-    MetricModel = None
-    TestModel = None
-    TurnModel = None
-    CampaignRepository = None
-    DatabaseManager = None
+    Base = None  # type: ignore[misc,assignment]
+    CampaignModel = None  # type: ignore[misc,assignment]
+    FindingModel = None  # type: ignore[misc,assignment]
+    MetricModel = None  # type: ignore[misc,assignment]
+    TestModel = None  # type: ignore[misc,assignment]
+    TurnModel = None  # type: ignore[misc,assignment]
+    CampaignRepository = None  # type: ignore[misc,assignment]
+    DatabaseManager = None  # type: ignore[misc,assignment]
     DEFAULT_DB_URL = "sqlite+aiosqlite:///.cyberjection/results.db"
     _SQLALCHEMY_AVAILABLE = False
 

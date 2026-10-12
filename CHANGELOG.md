@@ -2,6 +2,65 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.12.0] - Industry readiness
+
+### Fixed
+
+- **`max_cost_cap` was never enforced.** New `cyberjection.budget` checks
+  the cap before every target, attacker and judge call and charges real
+  cost afterwards (LiteLLM pricing data, or a target's new `pricing`
+  block). Unpriceable calls are counted, never guessed. A budget stop
+  skips unstarted tests, persists `BUDGET_EXCEEDED` with total cost, and
+  makes `cyberjection run` exit 5 after writing its reports.
+- **LLM judge prompt injection.** Attack prompts and target responses are
+  wrapped in per-call random-nonce tags with untrusted-data rules, and a
+  manipulation tripwire downgrades a fooled "not jailbroken" verdict to
+  UNCERTAIN.
+- **Crash on any persisted run with more than one test**
+  (`UNIQUE constraint failed: tests.id`): concurrent test cases shared one
+  AsyncSession. Repository calls are now serialized; model calls stay
+  concurrent. Present on `main` before this release.
+- SSRF guard bypasses (trailing dots, `*.localhost`, decimal/hex/octal/short
+  IPv4, IPv4-mapped IPv6, unspecified addresses).
+- API 500 responses no longer return exception text (logged with an
+  incident id instead).
+- `/api/plugins` imported third-party plugins on every request.
+- `hubguard file` blocked non-model files (e.g. a README); it now scans
+  recognized model formats by extension or magic bytes and skips the rest.
+- Budget-stopped campaigns now get a finish time.
+- `listen_for_aborts` was annotated as returning `None` but returns the
+  abort message; the whole package is now mypy-strict clean.
+- Rate limiter: SHA-1 marked `usedforsecurity=False`; startup assert
+  replaced by an explicit check.
+
+### Added
+
+- `cyberjection run --local-only`: local targets only, single-turn
+  strategies, no remote judge; for pre-commit hooks.
+- OWASP Top 10 for LLM Applications (2025) coverage report
+  (`--format owasp-llm`).
+- Optional API bearer-token auth (`CYBERJECTION_API_TOKEN` /
+  `--api-token`), with a warning when serving beyond loopback without it.
+- Optional HMAC-keyed audit log (`CYBERJECTION_AUDIT_KEY`) and
+  `cyberjection audit --verify-log`.
+- `.pre-commit-hooks.yaml`, a GitHub Action (`action.yml`), GitLab CI
+  templates, and a scheduled compliance workflow example.
+- `cyberjection --version`; version single-sourced from package metadata.
+- Packaging: PyPI metadata and URLs, `py.typed`, sdist contents,
+  `uv.lock`, dashboard `package-lock.json`.
+- CI: Python 3.12 and 3.13 matrix with a coverage floor, ruff + mypy +
+  lockfile check, dashboard `npm ci`/`npm audit`/build, wheel build and
+  clean-install smoke test, all actions pinned to commit SHAs with
+  read-only default permissions; Dependabot; trusted-publishing release
+  workflow.
+- An end-to-end test suite that drives the real CLI over HTTP against an
+  OpenAI-compatible server (target, attacker and judge).
+
+### Changed
+
+- Dashboard: React Router 6 -> 7 (clears two moderate advisories).
+- Ruff policy pinned in `pyproject.toml` (correctness and security rules).
+
 ## [0.11.0] - Phase 11: HubGuard & Model Supply Chain Security
 
 ### Added

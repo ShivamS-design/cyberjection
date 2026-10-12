@@ -112,7 +112,7 @@ async def _execute_eval_turn(
         await limiter.close()
 
 
-@celery_app.task(bind=True, max_retries=MAX_RETRIES, default_retry_delay=5)
+@celery_app.task(bind=True, max_retries=MAX_RETRIES, default_retry_delay=5)  # type: ignore[untyped-decorator]
 def execute_eval_turn_task(
     self: Any,
     target_id: str,

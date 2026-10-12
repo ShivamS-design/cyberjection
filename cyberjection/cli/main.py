@@ -78,6 +78,23 @@ app = typer.Typer(
 )
 console = Console()
 
+
+def _print_version(value: bool) -> None:
+    if value:
+        from cyberjection import __version__
+
+        console.print(f"cyberjection {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False, "--version", callback=_print_version, is_eager=True, help="Show the version and exit."
+    ),
+) -> None:
+    """Enterprise AI Security & Guardrail Evaluation Harness."""
+
 # Overridable so a deployment can point audit logs at a durable/shared
 # location; defaults alongside the SQLite results DB's own default
 # directory, matching the `.cyberjection/` convention `DatabaseManager`
@@ -141,6 +158,7 @@ async def _execute_pipeline(
     *,
     db_url: Optional[str] = None,
     resume_campaign_id: Optional[str] = None,
+    local_only: bool = False,
 ) -> List[Finding]:
     """Runs `config`'s test cases through
     `cyberjection.orchestrator.execute_campaign`, scoped to the ones that
@@ -169,6 +187,7 @@ async def _execute_pipeline(
         db_url=db_url,
         resume_campaign_id=resume_campaign_id,
         max_concurrency=config.max_workers,
+        local_only=local_only,
     )
 
 
@@ -217,6 +236,12 @@ def run_evaluation(
         help="Resume a previously interrupted campaign by its campaign id (see `cyberjection "
         "inspect`) instead of starting a new one",
     ),
+    local_only: bool = typer.Option(
+        False,
+        "--local-only",
+        help="Fast, zero-cost check for pre-commit hooks: the target must be a local endpoint, "
+        "only single-turn strategies run, and the remote LLM judge is disabled",
+    ),
 ) -> None:
     """Execute automated security evaluations against a specified target model."""
 
@@ -248,6 +273,26 @@ def run_evaluation(
     safe_json_out = _safe_output_path(json_out) if json_out else None
     safe_markdown_out = _safe_output_path(markdown_out) if markdown_out else None
 
+    if local_only:
+        from cyberjection.security.input_validation import is_local_endpoint
+
+        if not is_local_endpoint(target.provider.value, target.api_base):
+            console.print(
+                f"[bold red]--local-only refuses target {escape(target.id)}:[/bold red] its endpoint "
+                f"({escape(target.api_base or target.provider.value + ' default')}) is not on this machine "
+                "or a private network, so prompts would leave it. Point api_base at a local server "
+                "(Ollama, vLLM, LM Studio) or drop --local-only."
+            )
+            _audit_logger.log("cli.run.local_only_refused", resource=target.id, outcome="failure")
+            raise typer.Exit(code=EXIT_USAGE_ERROR)
+        try:
+            import litellm
+
+            litellm.telemetry = False  # nothing leaves the machine in this mode
+        except ImportError:  # pragma: no cover - litellm is a hard dependency
+            pass
+        console.print("[bold blue]Local-only mode:[/bold blue] single-turn strategies, no remote judge.")
+
     if config.hubguard is not None and target.provider == ProviderType.HUGGINGFACE:
         _enforce_hubguard_gate(config, target)
 
@@ -255,7 +300,9 @@ def run_evaluation(
     budget_stop: Optional[BudgetExceededError] = None
     try:
         findings = asyncio.run(
-            _execute_pipeline(config, target, db_url=db_url, resume_campaign_id=resume_campaign_id)
+            _execute_pipeline(
+                config, target, db_url=db_url, resume_campaign_id=resume_campaign_id, local_only=local_only
+            )
         )
     except BudgetExceededError as exc:
         budget_stop = exc
@@ -895,6 +942,17 @@ def hubguard_gate(
     raise typer.Exit(code=EXIT_OK)
 
 
+def _has_model_magic(path: Path) -> bool:
+    """Pickle (protocol 2+), ZIP (PyTorch/npz) or .npy content, whatever the
+    file is named -- so renaming a payload to `.txt` doesn't skip the scan."""
+
+    with path.open("rb") as handle:
+        head = handle.read(8)
+    return head[:1] == b"\x80" and head[1:2] in (b"\x02", b"\x03", b"\x04", b"\x05") or head.startswith(
+        (b"PK\x03\x04", b"\x93NUMPY")
+    )
+
+
 @hubguard_app.command("file")
 def hubguard_file(
     paths: List[Path] = typer.Argument(..., help="Local .bin/.pt/.pkl/.npy/.safetensors/.py files to scan"),
@@ -905,7 +963,7 @@ def hubguard_file(
     from datetime import datetime, timezone
 
     from cyberjection.hubguard.models import HubGuardReport, ScannedFile
-    from cyberjection.hubguard.picklescan import scan_pickle_file
+    from cyberjection.hubguard.picklescan import is_pickle_candidate, scan_pickle_file
     from cyberjection.hubguard.remotecode import analyze_python_source
     from cyberjection.hubguard.safetensors import validate_safetensors_file
 
@@ -923,10 +981,15 @@ def hubguard_file(
             source = path.read_text(encoding="utf-8", errors="replace")
             findings += analyze_python_source(source, filename=path.name).findings
             kind = "code"
-        else:
+        elif is_pickle_candidate(str(path)) or _has_model_magic(path):
             result = scan_pickle_file(path)
             findings += result.findings
             kind = result.format
+        else:
+            # Not a model format: nothing that loading could execute. Reported,
+            # not failed (fail-closed applies to formats we should understand).
+            console.print(f"[dim]Skipped {escape(str(path))}: not a recognized model file format.[/dim]")
+            kind = "skipped"
         scanned.append(ScannedFile(path=str(path), size=path.stat().st_size, kind=kind))
     report = HubGuardReport.build(
         repo_id="local-files",

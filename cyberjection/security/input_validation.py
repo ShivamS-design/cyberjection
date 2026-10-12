@@ -209,3 +209,21 @@ def enforce_payload_size_limit(
     if size > max_bytes:
         raise PayloadTooLargeError(f"{label} is {size} bytes, exceeding the {max_bytes}-byte limit")
     return text
+
+
+def is_local_endpoint(provider: str, api_base: Optional[str]) -> bool:
+    """True if a target's traffic stays on this machine or its private
+    network: an explicit `api_base` on a loopback/private/link-local
+    address (or a localhost name), or Ollama on its default
+    `localhost:11434` endpoint. Hostnames other than localhost are not
+    resolved, so a LAN host must be given by IP to count as local.
+    Used by `cyberjection run --local-only`."""
+
+    if not api_base:
+        return provider == "ollama"
+    try:
+        assert_safe_target_url(api_base)
+    except UnsafeTargetURLError as exc:
+        # Rejected as non-public (rather than for a bad scheme) => local.
+        return "unsupported URL scheme" not in str(exc) and "no resolvable hostname" not in str(exc)
+    return False

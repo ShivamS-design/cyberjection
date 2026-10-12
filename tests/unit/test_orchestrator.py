@@ -765,9 +765,9 @@ class TestExecuteCampaign:
         captured: Dict[str, Any] = {}
 
         class _CapturingOrchestrator(campaign_mod.CampaignOrchestrator):
-            def __init__(self, *, repository=None, resumability=None, max_concurrency=10) -> None:
+            def __init__(self, *, repository=None, resumability=None, max_concurrency=10, **kwargs) -> None:
                 captured["max_concurrency"] = max_concurrency
-                super().__init__(repository=repository, resumability=resumability, max_concurrency=max_concurrency)
+                super().__init__(repository=repository, resumability=resumability, max_concurrency=max_concurrency, **kwargs)
 
         monkeypatch.setattr(campaign_mod, "CampaignOrchestrator", _CapturingOrchestrator)
 

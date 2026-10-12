@@ -56,7 +56,7 @@ class BudgetTracker:
     priced_calls: int = 0
     unpriced_calls: int = 0
     exceeded: bool = False
-    _children: list = field(default_factory=list, repr=False)
+    _children: "list[BudgetTracker]" = field(default_factory=list, repr=False)
 
     @property
     def root(self) -> "BudgetTracker":
@@ -155,7 +155,7 @@ def response_cost(response: Any, *, pricing: Any = None) -> Optional[float]:
     if pricing is not None and usage is not None:
         prompt = getattr(usage, "prompt_tokens", 0) or 0
         completion = getattr(usage, "completion_tokens", 0) or 0
-        return (prompt * pricing.input_per_million_usd + completion * pricing.output_per_million_usd) / 1_000_000
+        return float(prompt * pricing.input_per_million_usd + completion * pricing.output_per_million_usd) / 1_000_000
 
     hidden = getattr(response, "_hidden_params", None)
     if isinstance(hidden, dict):

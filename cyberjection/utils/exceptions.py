@@ -8,7 +8,7 @@ than every underlying HTTP/YAML/Pydantic library's native error types.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, List, Optional
 
 
 class CyberjectionException(Exception):
@@ -55,7 +55,7 @@ class BudgetExceededError(CyberjectionException):
         target_id: Optional[str] = None,
         spent_usd: float = 0.0,
         cap_usd: Optional[float] = None,
-        findings: Optional[list] = None,
+        findings: Optional[List[Any]] = None,
     ) -> None:
         super().__init__(message, target_id=target_id)
         self.spent_usd = spent_usd

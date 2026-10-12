@@ -256,7 +256,32 @@ Pipeline Integration, CLI Harness & Enterprise Reporting**,
 - A campaign `hubguard:` section makes `cyberjection run` refuse to start
   against a `BLOCK`ed `huggingface` target (exit code 4).
 
+### 0.12.0: industry readiness
+
+- **Enforced budget caps**: `max_cost_cap` now really stops spend across
+  target, attacker and judge calls (exit code 5, reports still written).
+- **Judge hardening**: nonce-tagged untrusted content plus a manipulation
+  tripwire, so a target response can't talk the LLM judge into a PASS.
+- **`cyberjection run --local-only`**: zero-cost, nothing-leaves-the-machine
+  checks for pre-commit hooks.
+- **OWASP Top 10 for LLM Applications (2025)** coverage report
+  (`--format owasp-llm`).
+- **Integrations**: pre-commit hooks, a GitHub Action (`action.yml`),
+  GitLab CI templates, and a scheduled compliance example.
+- **Hardening**: optional API bearer token, HMAC-keyed audit log
+  (`audit --verify-log`), stricter SSRF guard, no exception text in API
+  errors, and a fix for a crash when concurrent tests persisted results.
+- **Packaging**: PyPI-ready metadata, `cyberjection --version`, typed
+  package (`py.typed`), lockfiles, SHA-pinned CI, Dependabot, and a
+  trusted-publishing release workflow.
+
 ## Installation
+
+```bash
+pip install cyberjection            # once published to PyPI
+```
+
+From source:
 
 ```bash
 python3.12 -m venv .venv
@@ -387,7 +412,8 @@ cyberjection run \
   --sarif-out results.sarif \
   --json-out results.json
 # exits 0 (pass), 1 (quality gate failed), 2 (usage/config error),
-# or 3 (a command's runtime dependency isn't installed)
+# 3 (a runtime dependency isn't installed), 4 (HubGuard blocked the
+# target) or 5 (max_cost_cap reached; reports are still written)
 
 cyberjection inspect --limit 5     # browse recent persisted campaigns
 cyberjection export --from-json results.json --output results.md --format markdown
@@ -412,6 +438,40 @@ cyberjection plugins   # every registered mutator/strategy/evaluator/exporter al
 
 pip install -e ".[api]"   # installs uvicorn
 cyberjection serve --host 127.0.0.1 --port 8000
+```
+
+Fast local check before committing (no cost, nothing leaves the machine):
+
+```bash
+cyberjection run --config cyberjection.yaml --target local-model --local-only
+```
+
+or as a pre-commit hook:
+
+```yaml
+repos:
+  - repo: https://github.com/ShivamS-design/cyberjection
+    rev: v0.12.0
+    hooks:
+      - id: cyberjection-hubguard
+      - id: cyberjection-local
+        args: [--config, cyberjection.yaml, --target, local-model]
+```
+
+In GitHub Actions:
+
+```yaml
+- uses: ShivamS-design/cyberjection@v0.12.0
+  with:
+    command: run
+    config: cyberjection.yaml
+    target: support-agent
+```
+
+OWASP Top 10 for LLM Applications coverage from a run's JSON:
+
+```bash
+cyberjection export --from-json results.json --format owasp-llm --output owasp.md
 ```
 
 Audit a model repository's supply chain before deploying it (Phase 11):

@@ -28,7 +28,7 @@ exporter with per-call state should still expose `export` as a
 
 from __future__ import annotations
 
-from typing import Dict, List, Type
+from typing import Any, Callable, Dict, List, TypeVar
 
 
 class ExporterRegistrationError(Exception):
@@ -43,9 +43,10 @@ class _ExporterProtocolError(ExporterRegistrationError):
 
 
 _REGISTRY: Dict[str, type] = {}
+_T = TypeVar("_T", bound=type)
 
 
-def register_exporter(alias: str):
+def register_exporter(alias: str) -> Callable[[_T], _T]:
     """Class decorator registering an exporter class under ``alias``. Any
     class exposing a callable `export` attribute qualifies -- see the
     module docstring for why there's no shared base class to check
@@ -53,7 +54,7 @@ def register_exporter(alias: str):
     idempotent; registering a *different* class under an alias already in
     use raises :class:`ExporterRegistrationError`."""
 
-    def decorator(cls: Type) -> Type:
+    def decorator(cls: _T) -> _T:
         if not callable(getattr(cls, "export", None)):
             raise _ExporterProtocolError(
                 f"Cannot register '{alias}': {cls!r} has no callable 'export' attribute."
@@ -74,7 +75,7 @@ def is_registered(alias: str) -> bool:
     return alias in _REGISTRY
 
 
-def get_exporter_class(alias: str) -> type:
+def get_exporter_class(alias: str) -> Any:
     try:
         return _REGISTRY[alias]
     except KeyError as exc:

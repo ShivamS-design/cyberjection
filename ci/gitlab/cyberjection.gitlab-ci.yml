@@ -1,0 +1,45 @@
+# Reusable GitLab CI template. Include it from your project's .gitlab-ci.yml:
+#
+#   include:
+#     - remote: https://raw.githubusercontent.com/ShivamS-design/cyberjection/main/ci/gitlab/cyberjection.gitlab-ci.yml
+#
+#   cyberjection-gate:
+#     extends: .cyberjection-run
+#     variables:
+#       CYBERJECTION_CONFIG: cyberjection.yaml
+#       CYBERJECTION_TARGET: support-agent
+#
+# Exit codes: 0 pass, 1 quality gate failed, 2 usage error,
+# 4 supply chain blocked, 5 budget exceeded.
+
+.cyberjection-base:
+  image: python:3.12-slim
+  variables:
+    CYBERJECTION_VERSION: ""        # e.g. "==0.12.0"; empty installs the latest release
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  before_script:
+    - python -m pip install "cyberjection${CYBERJECTION_VERSION}"
+
+.cyberjection-run:
+  extends: .cyberjection-base
+  variables:
+    CYBERJECTION_CONFIG: cyberjection.yaml
+    CYBERJECTION_TARGET: ""
+    CYBERJECTION_THRESHOLD: ""
+  script:
+    - |
+      args="run --config $CYBERJECTION_CONFIG --target $CYBERJECTION_TARGET --sarif-out gl-cyberjection.sarif --json-out cyberjection.json"
+      if [ -n "$CYBERJECTION_THRESHOLD" ]; then args="$args --threshold $CYBERJECTION_THRESHOLD"; fi
+      cyberjection $args
+  artifacts:
+    when: always
+    paths: [gl-cyberjection.sarif, cyberjection.json]
+    reports:
+      sast: gl-cyberjection.sarif
+
+.cyberjection-hubguard:
+  extends: .cyberjection-base
+  variables:
+    CYBERJECTION_CONFIG: cyberjection.yaml
+  script:
+    - cyberjection hubguard gate --config "$CYBERJECTION_CONFIG"

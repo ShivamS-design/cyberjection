@@ -53,7 +53,7 @@ def compute_backoff_delay(
     total = delay + jitter
     if cap is not None:
         total = min(total, cap)
-    return total
+    return float(total)
 
 
 def build_dead_letter_payload(

@@ -344,3 +344,18 @@ class TestConcurrentPersistence:
             assert row.status == "COMPLETED" and len(tests) == 25
             assert all(t.status == "COMPLETED" for t in tests)
         await manager.close()
+
+
+async def test_budget_exceeded_campaign_gets_a_finish_time(calls: List[Dict[str, Any]], tmp_path: Path) -> None:
+    pytest.importorskip("sqlalchemy")
+    db_url = f"sqlite+aiosqlite:///{(tmp_path / 'f.db').as_posix()}"
+    with pytest.raises(BudgetExceededError):
+        await execute_campaign(campaign(n_tests=3, cap=0.05), db_url=db_url, max_concurrency=1)
+    from cyberjection.persistence import CampaignRepository, DatabaseManager
+
+    manager = DatabaseManager(db_url)
+    await manager.init_db()
+    async with manager.session() as session:
+        [row] = await CampaignRepository(session).list_recent_campaigns(limit=1)
+        assert row.status == "BUDGET_EXCEEDED" and row.finished_at is not None
+    await manager.close()

@@ -139,6 +139,22 @@ against OWASP ASVS 4.0 and the SOC 2 (2017) Trust Services Criteria. See
 [`docs/COMPLIANCE.md`](COMPLIANCE.md) for the full table and an
 explanation of why this is a self-assessment, not a certification.
 
+## Evaluation integrity and cost controls (0.12.0)
+
+- **Judge prompt-injection hardening.** The Tier 3 judge receives the attack
+  prompt and target response inside per-call random-nonce tags, with rules
+  stating that tagged content is untrusted data. A tripwire downgrades a
+  "not jailbroken" verdict to `UNCERTAIN` when the response contains
+  grader-manipulation markers, so a manipulated judge can't produce a silent
+  PASS.
+- **Enforced budget cap.** `max_cost_cap` is checked before every target,
+  attacker and judge call; overspend is bounded to calls already in flight.
+- **Concurrent persistence.** Repository access is serialized per campaign,
+  fixing a crash when concurrent test cases shared one database session.
+- **API.** Optional bearer-token auth; 500 responses carry an incident id,
+  never exception text.
+- **Audit log.** Optional HMAC-keyed chain with downgrade detection.
+
 ## Model supply-chain controls (Phase 11)
 
 Phase 11 adds controls that protect the *operator's* environment from
@@ -183,6 +199,11 @@ at content Cyberjection downloads rather than at its own operation.
   pattern. It is a defense-in-depth check, not a substitute for a
   dedicated secret-scanning service or pre-commit hook in front of your
   own fork's CI.
+- The judge tripwire is pattern-based: it catches common grader-manipulation
+  phrasing, not every possible one. It reduces silent PASSes; it doesn't make
+  an LLM judge adversarially robust. Keep Tier 1 patterns for known secrets.
+- `max_cost_cap` only covers calls whose cost is known; the CLI reports
+  unpriced calls. Add a `pricing` block for custom models.
 - HubGuard's static analyzers can be evaded by code they can't resolve;
   those cases are reported (fail closed) but the report can't say what
   the code would have done. The opt-in sandbox profiler uses PEP 578

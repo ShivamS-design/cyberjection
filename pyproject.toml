@@ -4,18 +4,31 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cyberjection"
-version = "0.11.0"
+version = "0.12.0"
 description = "Enterprise-grade asynchronous LLM red-teaming and security orchestration framework"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Cyberjection Contributors" }]
-keywords = ["llm", "security", "red-team", "jailbreak", "ai-safety"]
+keywords = [
+    "llm", "security", "red-team", "jailbreak", "ai-safety", "prompt-injection",
+    "owasp", "supply-chain", "huggingface", "safetensors", "devsecops",
+]
 classifiers = [
-    "Programming Language :: Python :: 3.12",
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
     "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
 ]
 
 dependencies = [
@@ -31,6 +44,13 @@ dependencies = [
     "redis>=5.0.1",  # 5.0.1 introduced aclose(), which replaces the deprecated close()
     "celery>=5.4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ShivamS-design/cyberjection"
+Documentation = "https://github.com/ShivamS-design/cyberjection/tree/main/docs"
+Issues = "https://github.com/ShivamS-design/cyberjection/issues"
+Changelog = "https://github.com/ShivamS-design/cyberjection/blob/main/CHANGELOG.md"
+Security = "https://github.com/ShivamS-design/cyberjection/blob/main/docs/SECURITY.md"
 
 [project.optional-dependencies]
 dev = [
@@ -62,6 +82,9 @@ cyberjection = "cyberjection.cli.main:app"
 [tool.hatch.build.targets.wheel]
 packages = ["cyberjection"]
 
+[tool.hatch.build.targets.sdist]
+include = ["cyberjection", "tests", "docs", "examples", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
@@ -73,3 +96,20 @@ source = ["cyberjection"]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Correctness and security rules; formatting/modernization rules (UP, I)
+# are intentionally not enforced so lint failures always mean something.
+select = ["F", "E4", "E7", "E9", "B", "PLE", "ASYNC", "S102", "S301", "S307"]
+ignore = [
+    "B008",  # typer.Option(...) defaults are the framework's documented idiom
+    "B904",  # `raise ... from` inside except is applied where the cause matters
+    "E731",  # small lambdas in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S301", "B017", "B011"]  # tests build malicious pickles on purpose

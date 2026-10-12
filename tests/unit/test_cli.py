@@ -92,7 +92,7 @@ def _stub_pipeline(monkeypatch):
     # `_inspect_async` -- see `_canned_findings()` above for why.
     import cyberjection.cli.main as cli_main
 
-    async def _fake_execute_pipeline(config, target, *, db_url=None, resume_campaign_id=None):
+    async def _fake_execute_pipeline(config, target, *, db_url=None, resume_campaign_id=None, local_only=False):
         return _canned_findings()
 
     monkeypatch.setattr(cli_main, "_execute_pipeline", _fake_execute_pipeline)
