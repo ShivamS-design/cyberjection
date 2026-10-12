@@ -17,6 +17,7 @@ from cyberjection.attacks.attacker import AttackerAgent
 from cyberjection.attacks.state import AttackNode, ConversationContext, TurnStatus, score_from_evaluation
 from cyberjection.evaluators.cascade import CascadeEvaluator
 from cyberjection.providers.litellm_provider import LiteLLMTarget
+from cyberjection.utils.exceptions import BudgetExceededError
 
 logger = logging.getLogger("cyberjection.attacks.tap")
 
@@ -78,6 +79,10 @@ class TAPEngine:
                     *[self.attacker.generate_next_payload(goal, history) for _ in range(self.branching_factor)],
                     return_exceptions=True,
                 )
+
+                budget_stop = next((o for o in attacker_outputs if isinstance(o, BudgetExceededError)), None)
+                if budget_stop is not None:
+                    raise budget_stop  # a spent budget ends the search, not just one branch
 
                 for attacker_out in attacker_outputs:
                     if isinstance(attacker_out, BaseException):

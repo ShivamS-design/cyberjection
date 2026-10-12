@@ -38,6 +38,15 @@ class AssertionType(str, Enum):
     LLM_JUDGE = "llm-judge"
 
 
+class PricingConfig(BaseModel):
+    """Explicit per-token pricing for a target LiteLLM can't price itself
+    (self-hosted, fine-tuned or custom endpoints). Used by
+    `cyberjection.budget` to enforce `max_cost_cap`."""
+
+    input_per_million_usd: float = Field(..., ge=0.0, description="USD per 1M prompt tokens.")
+    output_per_million_usd: float = Field(..., ge=0.0, description="USD per 1M completion tokens.")
+
+
 class RateLimitConfig(BaseModel):
     """Per-target concurrency and throughput guard rails."""
 
@@ -106,6 +115,9 @@ class TargetConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=1)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    pricing: Optional[PricingConfig] = Field(
+        default=None, description="Override LiteLLM's pricing data for budget enforcement."
+    )
     custom_headers: Dict[str, str] = Field(default_factory=dict)
     trust_remote_code: bool = Field(
         default=False, description="Whether this (Hugging Face) target is loaded with trust_remote_code=True."
@@ -170,7 +182,11 @@ class CampaignConfig(BaseModel):
     targets: List[TargetConfig]
     strategies: List[StrategyConfig] = Field(default_factory=list)
     tests: List[TestCaseConfig] = Field(default_factory=list)
-    max_cost_cap: float = Field(default=10.0, ge=0.0)
+    max_cost_cap: float = Field(
+        default=10.0,
+        ge=0.0,
+        description="USD cap on measured model spend (target, attacker and judge calls); 0 disables it.",
+    )
     max_workers: int = Field(default=50, ge=1, le=200)
     quality_gate: QualityGateConfig = Field(default_factory=QualityGateConfig)
     hubguard: Optional[HubGuardConfig] = None

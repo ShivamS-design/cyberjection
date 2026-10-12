@@ -62,6 +62,7 @@ from cyberjection.security.secrets_audit import (
 if TYPE_CHECKING:
     from cyberjection.hubguard.models import HubGuardReport
 from cyberjection.utils.exceptions import (
+    BudgetExceededError,
     CampaignNotFoundError,
     ConfigValidationError,
     PathTraversalError,
@@ -96,6 +97,9 @@ EXIT_ENVIRONMENT_ERROR = 3
 # Phase 11: a HubGuard supply-chain audit returned BLOCK. Distinct from 1
 # so CI can tell "the model misbehaved" from "the model was never loaded".
 EXIT_SUPPLY_CHAIN_BLOCKED = 4
+# The campaign hit max_cost_cap before finishing. Reports still cover the
+# tests that ran, but a partial run must never look like a clean pass.
+EXIT_BUDGET_EXCEEDED = 5
 
 
 def _safe_output_path(path: Path) -> Path:
@@ -243,9 +247,20 @@ def run_evaluation(
         _enforce_hubguard_gate(config, target)
 
     effective_threshold = resolve_threshold(threshold, config.quality_gate.threshold)
+    budget_stop: Optional[BudgetExceededError] = None
     try:
         findings = asyncio.run(
             _execute_pipeline(config, target, db_url=db_url, resume_campaign_id=resume_campaign_id)
+        )
+    except BudgetExceededError as exc:
+        budget_stop = exc
+        findings = list(exc.findings)
+        console.print(f"[bold yellow]Budget cap reached:[/bold yellow] {escape(str(exc))}")
+        _audit_logger.log(
+            "cli.run.budget_exceeded",
+            resource=target.id,
+            outcome="partial",
+            metadata={"spent_usd": exc.spent_usd, "cap_usd": exc.cap_usd},
         )
     except CampaignNotFoundError as exc:
         console.print(f"[bold red]Cannot resume campaign:[/bold red] {escape(str(exc))}")
@@ -280,6 +295,13 @@ def run_evaluation(
             f"meets or exceeds threshold {gate.threshold:.1f}"
         )
         raise typer.Exit(code=EXIT_QUALITY_GATE_FAILED)
+
+    if budget_stop is not None:
+        console.print(
+            "[bold yellow]INCOMPLETE:[/bold yellow] the campaign stopped at its budget cap; "
+            "raise max_cost_cap or narrow the campaign to evaluate every test."
+        )
+        raise typer.Exit(code=EXIT_BUDGET_EXCEEDED)
 
     console.print("[bold green]QUALITY GATE PASSED[/bold green]")
     raise typer.Exit(code=EXIT_OK)

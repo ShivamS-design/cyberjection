@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
+from cyberjection import budget
 from cyberjection.utils.exceptions import AttackerGenerationError
 
 ATTACKER_SYSTEM_PROMPT = """You are an automated security red-teaming agent testing a target LLM's safety guardrails.
@@ -91,6 +92,7 @@ class AttackerAgent:
 
         last_error: Optional[BaseException] = None
         for attempt in range(self.max_retries + 1):
+            budget.preflight("attacker call")  # outside the try: must propagate
             try:
                 response = await acompletion(
                     model=self.model,
@@ -98,6 +100,7 @@ class AttackerAgent:
                     temperature=0.7,
                     response_format={"type": "json_object"},
                 )
+                budget.record(budget.response_cost(response), "attacker call")
                 raw_content = response.choices[0].message.content
                 if not raw_content:
                     raise ValueError("Attacker model returned an empty response body.")
