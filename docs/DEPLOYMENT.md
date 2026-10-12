@@ -1,114 +1,148 @@
-# Deployment (Phase 10)
+# Deployment
 
-Cyberjection ships two ways to run the dashboard API and web dashboard
-alongside the existing CLI: directly via `pip install` + `cyberjection
-serve`, or as containers via the repo-root `Dockerfile` /
-`apps/dashboard/Dockerfile` / `docker-compose.yml`. This page covers the
-container path, the deployment model it assumes, and what's deliberately
-out of scope.
+Cyberjection runs as a plain Python application: the CLI, the dashboard
+API and the built web dashboard are all served by one process started
+with `cyberjection serve`. There are no container images; the project
+ships no Dockerfile or compose file (they were removed in 0.11.0). If you
+want to containerize or orchestrate it, wrap the commands on this page in
+whatever runtime your organization uses.
 
 ## Deployment model: single trusted team, one instance
 
-Every artifact in this phase -- the dashboard API's lack of
-authentication (see `docs/COMPLIANCE.md`'s ASVS-V2/ASVS-V13 entries),
-`docker-compose.yml`'s single `api` + `dashboard` (+ optional `redis`)
-service set, the SQLite-by-default persistence layer -- assumes **one
-Cyberjection instance serving one trusted team**, run inside a network
-perimeter that team already controls (a VPN, an internal network, a
-reverse proxy with its own SSO/auth in front). It is not a multi-tenant
-SaaS deployment model: there is no per-team data isolation, no
-per-user login, no per-team billing or rate limiting anywhere in this
-codebase.
+The dashboard API has no authentication of its own (see
+`docs/COMPLIANCE.md`'s ASVS-V2/ASVS-V13 entries), and persistence is
+SQLite by default. Everything here assumes **one Cyberjection instance
+serving one trusted team**, inside a network perimeter that team already
+controls: a VPN, an internal network, or a reverse proxy with its own
+SSO/auth in front. It is not a multi-tenant deployment model. There is no
+per-team data isolation, per-user login, or per-team rate limiting.
 
-If your threat model requires exposing the dashboard beyond a trusted
-team's own network, put an authenticating reverse proxy (e.g. an
-OAuth2 proxy, or your cloud provider's identity-aware proxy) in front of
-it first -- do not expose `cyberjection serve`'s port directly to the
-public internet.
+If the dashboard must be reachable beyond a trusted team's own network,
+put an authenticating reverse proxy (an OAuth2 proxy, or your cloud
+provider's identity-aware proxy) in front of it first. Do not expose
+`cyberjection serve`'s port directly to the public internet.
 
-## Running via Docker Compose
+## 1. Install
 
 ```bash
-docker compose up --build
+python3.12 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e ".[api]"            # pulls in uvicorn
 ```
 
-This builds and starts two services:
+`serve` requires the `api` extra (`uvicorn`). Without it, the command
+exits with a clear environment error (exit code 3) rather than a bare
+`ImportError`.
 
-- **`api`** (`Dockerfile`, port `8000`): the CLI image, running
-  `cyberjection serve --host 0.0.0.0 --port 8000 --db-url
-  sqlite+aiosqlite:////data/results.db`. Campaign history persists in the
-  `cyberjection-data` named volume.
-- **`dashboard`** (`apps/dashboard/Dockerfile`, port `3000`): the built
-  React SPA served by nginx, which proxies `/api/` to the `api` service
-  (see `apps/dashboard/nginx.conf`).
+## 2. Build the web dashboard (optional)
 
-Open `http://localhost:3000` for the dashboard, or call the API directly
-at `http://localhost:8000/api/...`.
-
-To also start the Phase 7 Redis broker (only needed if you're running
-distributed Celery workers against `cyberjection/distributed/` --
-see `docs/ARCHITECTURE.md`'s "distributed queue remains unwired" note;
-neither the API nor the dashboard requires it):
-
-```bash
-docker compose --profile distributed up --build
-```
-
-Stop everything and remove the persisted database with:
-
-```bash
-docker compose down -v
-```
-
-## Running without Docker
-
-```bash
-pip install "cyberjection[api]"     # pulls in uvicorn
-cyberjection serve --host 0.0.0.0 --port 8000
-```
-
-`serve` requires the `api` extra (`uvicorn`); without it, the command
-exits with a clear environment error rather than a bare `ImportError`
-(the same degrade-gracefully contract `cyberjection inspect` already
-uses for a missing SQLAlchemy install -- see
-`cyberjection.api.server.UvicornUnavailableError`).
-
-For the dashboard itself outside a container:
+Requires Node.js 18+:
 
 ```bash
 cd apps/dashboard
 npm install
-npm run build   # outputs apps/dashboard/dist -- serve it with any static file server
+npm run build        # writes apps/dashboard/dist
 ```
 
-or `npm run dev` for a hot-reloading dev server (proxies `/api` to
-`http://127.0.0.1:8000` -- see `apps/dashboard/vite.config.ts`).
+## 3. Serve the API and the dashboard together
+
+```bash
+cyberjection serve --host 127.0.0.1 --port 8000 --dashboard-dir apps/dashboard/dist
+```
+
+Open `http://127.0.0.1:8000/` for the dashboard. The API is on the same
+origin at `http://127.0.0.1:8000/api/...`, so the dashboard's relative
+`/api/` fetches work with no proxy configuration. Without
+`--dashboard-dir`, `serve` runs the API alone.
+
+How `--dashboard-dir` behaves (`cyberjection/api/static.py`):
+
+- `/api/...` always goes to the API. An unknown API path returns a JSON
+  404, never the dashboard page.
+- Any other path serves the matching file from the dashboard directory.
+  Paths with no file extension (client-side routes such as
+  `/campaigns/<id>`) fall back to `index.html`, so deep links and reloads
+  work.
+- Path traversal (`..`, encoded or backslash variants, NUL bytes) and
+  symlinks pointing outside the directory are refused.
+- Responses carry `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy` and a same-origin `Content-Security-Policy`.
+  `index.html` is never cached; Vite's content-hashed `assets/` files are
+  cached as immutable.
+- If the directory has no `index.html`, `serve` exits with a usage error
+  telling you to build the dashboard first.
+
+## Development
+
+For dashboard development, run the API and Vite's hot-reloading dev
+server side by side:
+
+```bash
+cyberjection serve --port 8000                  # terminal 1
+cd apps/dashboard && npm run dev                 # terminal 2, http://127.0.0.1:5173
+```
+
+The dev server proxies `/api` to `http://127.0.0.1:8000` (see
+`apps/dashboard/vite.config.ts`).
+
+## Running as a service
+
+Any process supervisor works. A minimal systemd unit:
+
+```ini
+[Unit]
+Description=Cyberjection dashboard
+After=network.target
+
+[Service]
+User=cyberjection
+WorkingDirectory=/opt/cyberjection
+Environment=CYBERJECTION_AUDIT_LOG=/var/lib/cyberjection/audit.jsonl
+Environment=CYBERJECTION_DASHBOARD_DIR=/opt/cyberjection/apps/dashboard/dist
+ExecStart=/opt/cyberjection/.venv/bin/cyberjection serve --host 127.0.0.1 --port 8000 \
+  --db-url sqlite+aiosqlite:////var/lib/cyberjection/results.db
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cyberjection
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Run it as an unprivileged user, bind to `127.0.0.1`, and terminate TLS
+in the reverse proxy in front of it.
+
+## Redis (optional, distributed workers only)
+
+Only needed if you run the Phase 7 distributed Celery workers
+(`cyberjection/distributed/`). Neither the API nor the dashboard uses
+it. Install Redis from your platform's package manager (for example
+`apt install redis-server` or `brew install redis`), or use a managed
+Redis service, then point `CYBERJECTION_CELERY_BROKER_URL` at it.
+
+The unit tests don't need Redis at all; they use in-memory `fakeredis`
+servers (see `docs/TESTING.md`).
 
 ## Configuration
 
-| Variable / flag | Where | Purpose |
-|---|---|---|
-| `cyberjection serve --db-url` | CLI, or the `api` service's `command:` in `docker-compose.yml` | Database URL the API reads campaign history from (same format as `cyberjection run --db-url`); the compose file bakes in `sqlite+aiosqlite:////data/results.db` by default. |
-| `API_UPSTREAM` | `apps/dashboard/Dockerfile` / nginx env | Where the dashboard's nginx proxy forwards `/api/` requests; defaults to `http://cyberjection-api:8000`, the compose service name. |
-| `CYBERJECTION_AUDIT_LOG` | CLI / Dockerfile `ENV` | Where `cyberjection.security.audit_log.AuditLogger` writes; defaults to `/data/audit.jsonl` in the container image. |
+| Variable / flag | Purpose |
+|---|---|
+| `cyberjection serve --db-url` | Database URL the API reads campaign history from (same format as `cyberjection run --db-url`). Defaults to the local SQLite results DB. |
+| `--dashboard-dir` / `CYBERJECTION_DASHBOARD_DIR` | Built dashboard directory to serve on the same origin as the API. |
+| `CYBERJECTION_AUDIT_LOG` | Where `cyberjection.security.audit_log.AuditLogger` writes. Defaults to `.cyberjection/audit.jsonl` in the working directory. |
+| `CYBERJECTION_CELERY_BROKER_URL` | Redis URL for the optional distributed workers. |
+| `HF_TOKEN`, `HF_ENDPOINT` | Hugging Face credentials and endpoint for HubGuard (Phase 11). The token is only ever sent to the Hub endpoint's own host. |
 
 ## What's not in scope
 
-- **Authentication and multi-tenancy.** See "Deployment model" above --
-  this is a deliberate scope boundary for Phase 10, not an oversight.
-  `docs/COMPLIANCE.md` tracks it as `PARTIAL` (ASVS-V2/ASVS-V13), not
-  `IMPLEMENTED`.
-- **TLS termination.** Neither the API nor the dashboard's nginx config
-  terminates TLS itself; put a TLS-terminating reverse proxy or load
-  balancer in front in any deployment reachable over an untrusted
-  network.
-- **Horizontal scaling / orchestration manifests.** `docker-compose.yml`
-  is a single-host deployment. A Kubernetes/Helm deployment is possible
-  (the images are plain OCI images with no compose-specific assumptions
-  baked in) but no manifests are provided; the "single trusted team, one
-  instance" model this phase targets doesn't call for one.
-- **Database backups.** The named Docker volume persists data across
-  container restarts, but nothing in this repository automates backing
-  it up. For a PostgreSQL deployment (`--db-url
-  postgresql+asyncpg://...`), use your database provider's own backup
-  tooling.
+- **Authentication and multi-tenancy.** See "Deployment model" above.
+  `docs/COMPLIANCE.md` tracks this as `PARTIAL` (ASVS-V2/ASVS-V13).
+- **TLS termination.** `cyberjection serve` speaks plain HTTP. Put a
+  TLS-terminating reverse proxy or load balancer in front of any
+  deployment reachable over an untrusted network.
+- **Horizontal scaling.** One process serves one team. Nothing here
+  coordinates several API instances.
+- **Database backups.** Nothing in this repository backs up the SQLite
+  file. For PostgreSQL (`--db-url postgresql+asyncpg://...`), use your
+  database provider's backup tooling.

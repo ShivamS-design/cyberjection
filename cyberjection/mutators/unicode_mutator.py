@@ -9,7 +9,7 @@ from typing import Optional
 from cyberjection.mutators.base import BaseMutator
 from cyberjection.mutators.registry import register_mutator
 
-ZERO_WIDTH_SPACE = "​"
+ZERO_WIDTH_SPACE = "\u200b"
 
 
 @register_mutator("unicode_zero_width")

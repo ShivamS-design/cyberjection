@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from celery.exceptions import MaxRetriesExceededError
 from celery.utils.log import get_task_logger

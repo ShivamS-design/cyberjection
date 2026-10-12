@@ -7,17 +7,13 @@ Two layers are tested separately:
   `DUAL_TOKEN_BUCKET_LUA` script. It needs no Redis client, no event loop,
   and no external service, so it runs identically everywhere.
 - `TestDistributedRateLimiterAcquire` exercises the real
-  `DistributedRateLimiter` against a real `redis.asyncio` client. In a
-  deployment with the `redis` package installed and a reachable Redis
-  server (see the spec's own `docker run redis:alpine` prerequisite),
-  this runs against genuine Redis, executing the real Lua script
-  server-side. In the offline sandbox this suite was developed and
-  hard-tested in, `redis.asyncio` resolves to a functional in-memory
-  double (see its module docstring) that dispatches `EVALSHA` for this
-  exact script to `evaluate_dual_bucket` under an `asyncio.Lock`,
-  reproducing Redis's single-threaded atomicity guarantee -- which is
-  precisely what `test_concurrent_acquire_never_exceeds_capacity` below
-  is designed to catch a regression of, either way.
+  `DistributedRateLimiter` through the real `redis.asyncio` client API.
+  By default `tests/conftest.py`'s `_redis_backend` fixture backs it with
+  in-memory `fakeredis` servers, which execute the real Lua script (via
+  `fakeredis[lua]`) with Redis's single-threaded atomicity -- precisely
+  what `test_concurrent_acquire_never_exceeds_capacity` below is designed
+  to catch a regression of. Set `CYBERJECTION_TEST_REDIS_URL` to run the
+  same tests against a genuine Redis server.
 """
 
 from __future__ import annotations

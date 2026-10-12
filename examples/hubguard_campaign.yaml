@@ -1,0 +1,35 @@
+# Phase 11 HubGuard campaign: model supply-chain gate.
+#
+# Declaring a `hubguard:` section makes `cyberjection run` audit every
+# `huggingface` target's repository *before* sending it a single prompt,
+# and refuse to start (exit code 4) if the audit verdict is BLOCK.
+#
+#   cyberjection hubguard gate -c examples/hubguard_campaign.yaml
+#   cyberjection run -c examples/hubguard_campaign.yaml -t production-candidate
+#
+# Gated repositories (like Llama 3) need HF_TOKEN set in the environment.
+# The token is only ever sent to the Hub endpoint itself, never to the CDN
+# hosts file downloads redirect to.
+
+version: "2.0"
+name: "enterprise-secure-deployment"
+
+hubguard:
+  enforce_safetensors: true       # STRICT SafeTensors-only policy
+  block_remote_code: true         # also rejects trust_remote_code: true at load time
+  max_allowed_risk_score: 2.0     # anything above LOW blocks
+  allowed_organizations:          # checked at config-load time and again at audit time
+    - "openai"
+    - "anthropic"
+    - "meta-llama"
+  history_depth: 10               # earlier commits scanned for leaked credentials
+  # manifest: "examples/llama3-8b-instruct.manifest.yaml"   # pin exact SHA-256s
+  # verify_downloads: true        # stream weights and verify the real bytes
+  # profile_remote_code: false    # opt-in: EXECUTES remote code in the sandbox
+
+targets:
+  - id: "production-candidate"
+    provider: "huggingface"
+    model: "huggingface/meta-llama/Llama-3-8B-Instruct"
+    trust_remote_code: false
+    # revision: "<commit sha>"    # audit (and pin) an exact revision

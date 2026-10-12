@@ -69,7 +69,7 @@ class LocalONNXGuardEvaluator(BaseEvaluator):
         """
 
         try:
-            import onnxruntime as ort  # type: ignore[import-not-found]
+            import onnxruntime as ort
         except ImportError:
             return None
         try:

@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 
 import jsonschema
-import pytest
 
 from cyberjection.reporting.models import Finding
 from cyberjection.reporting.sarif import SARIFReporter

@@ -416,15 +416,15 @@ class CampaignOrchestrator:
         goal = test_case.metadata.get("goal", test_case.seed_prompt)
 
         if strategy_config.type == "crescendo":
-            engine = CrescendoEngine(
+            crescendo = CrescendoEngine(
                 evaluator=evaluator, attacker=attacker, max_turns=strategy_config.max_turns
             )
             nodes: List[AttackNode] = []
-            async for node in engine.run(target, goal=goal, initial_prompt=test_case.seed_prompt):
+            async for node in crescendo.run(target, goal=goal, initial_prompt=test_case.seed_prompt):
                 nodes.append(node)
         else:  # "tap" -- the only other member of _MULTI_TURN_STRATEGY_TYPES
-            engine = TAPEngine(evaluator=evaluator, attacker=attacker)
-            nodes = await engine.execute_tree_search(target, goal=goal, seed_prompt=test_case.seed_prompt)
+            tap = TAPEngine(evaluator=evaluator, attacker=attacker)
+            nodes = await tap.execute_tree_search(target, goal=goal, seed_prompt=test_case.seed_prompt)
 
         verdict, score, reason = _verdict_from_multi_turn(nodes)
         turns = [TurnRecord(index + 1, node.prompt, node.response) for index, node in enumerate(nodes)]

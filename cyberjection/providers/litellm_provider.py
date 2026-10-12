@@ -81,6 +81,14 @@ class TargetResponse(BaseModel):
     model_used: str
 
 
+def _litellm_model_name(config: TargetConfig) -> str:
+    """`provider/model`, without doubling a provider prefix the model id
+    already carries (`huggingface/meta-llama/...` in Phase 11 campaigns)."""
+
+    prefix = f"{config.provider.value}/"
+    return config.model if config.model.startswith(prefix) else prefix + config.model
+
+
 def _classify_exception(exc: Exception, *, target_id: str) -> Exception:
     """Map a raw litellm/provider SDK exception onto a Cyberjection type."""
 
@@ -166,7 +174,7 @@ class LiteLLMTarget(BaseTarget):
                     self.config.api_key.get_secret_value() if self.config.api_key else None
                 )
                 response = await acompletion(
-                    model=f"{self.config.provider.value}/{self.config.model}",
+                    model=_litellm_model_name(self.config),
                     messages=messages,
                     temperature=self.config.temperature,
                     max_tokens=self.config.max_tokens,

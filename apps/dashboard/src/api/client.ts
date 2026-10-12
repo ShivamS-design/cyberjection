@@ -1,8 +1,9 @@
 import type { ApiErrorBody, CampaignDetail, CampaignSummary, PluginsResponse, TestDetail } from "../types";
 
-// Every request is a relative `/api/...` path -- see vite.config.ts's dev
-// proxy and apps/dashboard/nginx.conf's production proxy for why this
-// code never needs to know the backend's actual host/port.
+// Every request is a relative `/api/...` path: in development vite.config.ts
+// proxies it, and in production `cyberjection serve --dashboard-dir` serves
+// this app and the API from the same origin, so this code never needs to
+// know the backend's actual host/port.
 const API_BASE = "/api";
 
 export class ApiError extends Error {

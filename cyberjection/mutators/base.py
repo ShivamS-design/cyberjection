@@ -9,7 +9,7 @@ of mutators, feeding each mutator's output into the next.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Iterator, List
 
 
 class BaseMutator(ABC):
@@ -62,7 +62,7 @@ class MutatorPipeline:
     def __len__(self) -> int:
         return len(self.mutators)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator["BaseMutator"]:
         return iter(self.mutators)
 
     def __repr__(self) -> str:

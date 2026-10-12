@@ -37,8 +37,8 @@ leaving just the Markdown report body below).
 
 | Status | Count |
 |---|---|
-| IMPLEMENTED | 9 |
-| PARTIAL | 8 |
+| IMPLEMENTED | 10 |
+| PARTIAL | 9 |
 | NOT_APPLICABLE | 1 |
 | NOT_IMPLEMENTED | 0 |
 
@@ -47,13 +47,15 @@ leaving just the Markdown report body below).
 | Control | Title | Status | Evidence | Notes |
 |---|---|---|---|---|
 | ASVS-V1.1 | A verified architecture and threat model exists and is kept current | IMPLEMENTED | `docs/ARCHITECTURE.md#threat-model-summary` | Threat model table maps concrete risks to concrete mitigations, updated every phase. |
-| ASVS-V2 | Authentication controls | PARTIAL | `cyberjection/api/`<br>`docker-compose.yml`<br>`docs/DEPLOYMENT.md` | Phase 10's dashboard API (cyberjection.api) introduced Cyberjection's first network-facing surface, and it deliberately implements no authentication of its own -- the 'single trusted team, one instance' deployment model documented in docs/DEPLOYMENT.md puts the operator's own network perimeter/reverse proxy in front of it instead of building a second, likely-worse auth layer inside this project. Every endpoint is also read-only (see docs/ARCHITECTURE.md's Phase 10 section), so the surface an unauthenticated caller can reach is bounded to already-completed campaign history, not campaign execution. |
+| ASVS-V2 | Authentication controls | PARTIAL | `cyberjection/api/`<br>`cyberjection/api/static.py`<br>`docs/DEPLOYMENT.md` | Phase 10's dashboard API (cyberjection.api) introduced Cyberjection's first network-facing surface, and it deliberately implements no authentication of its own -- the 'single trusted team, one instance' deployment model documented in docs/DEPLOYMENT.md puts the operator's own network perimeter/reverse proxy in front of it instead of building a second, likely-worse auth layer inside this project. Every endpoint is also read-only (see docs/ARCHITECTURE.md's Phase 10 section), so the surface an unauthenticated caller can reach is bounded to already-completed campaign history, not campaign execution. |
 | ASVS-V4 | Access control | NOT_APPLICABLE | - | Still no multi-user authorization boundary: the CLI remains single-operator, and Phase 10's dashboard API has no user/session concept to scope access within -- see ASVS-V2's note above for why that's a deployment-perimeter decision rather than an in-app access-control gap. |
 | ASVS-V5.1 | Input validation is applied to all untrusted input | IMPLEMENTED | `cyberjection/security/input_validation.py:assert_safe_output_path`<br>`cyberjection/security/input_validation.py:assert_safe_target_url`<br>`cyberjection/security/input_validation.py:enforce_payload_size_limit`<br>`cyberjection/config/schema.py (Pydantic field validation)` | - |
 | ASVS-V5.2 | Sanitization / safe deserialization of structured input | IMPLEMENTED | `cyberjection/config/loader.py:_parse_yaml (uses yaml.safe_load, never yaml.load)` | - |
 | ASVS-V7.1 | Security-relevant events are logged with enough detail for later review | IMPLEMENTED | `cyberjection/security/audit_log.py:AuditLogger`<br>`cyberjection/cli/main.py (audit_logger.log(...) call sites)` | - |
 | ASVS-V7.4 | Log records are protected against unauthorized modification | PARTIAL | `cyberjection/security/audit_log.py:verify_chain` | Hash-chained log entries make tampering with an existing entry detectable via verify_chain(), but the log file itself has no filesystem-level write protection or off-host replication -- an attacker with delete access can still truncate and restart the chain. Full protection needs an append-only or remote log sink, which is deployment-environment-specific and out of this library's scope. |
 | ASVS-V9.1 | TLS is used for all external service communication | PARTIAL | `cyberjection/providers/litellm_provider.py (delegates HTTPS handling to litellm/httpx)` | Relies on litellm's own default HTTPS behavior; not independently verified or pinned by this codebase. |
+| ASVS-V10.2 | Malicious code search: third-party code and artifacts are checked for malicious behavior | PARTIAL | `cyberjection/hubguard/picklescan.py`<br>`cyberjection/hubguard/remotecode.py`<br>`cyberjection/hubguard/sandbox.py`<br>`tests/unit/test_hubguard_picklescan.py`<br>`tests/unit/test_hubguard_remotecode.py`<br>`tests/unit/test_hubguard_sandbox.py` | Phase 11 HubGuard statically scans third-party model artifacts (pickle checkpoints, trust_remote_code Python) before load and can behaviorally profile remote code in a restricted child interpreter. PARTIAL because static analysis can be evaded by code it cannot resolve (reported as findings, fail-closed) and the sandbox uses audit hooks, rlimits and a network namespace but no seccomp filter -- see the sandbox module docstring. Covers model artifacts, not this project's own Python dependencies (see ASVS-V14.2). |
+| ASVS-V10.3 | Deployed components' integrity is verified (signatures/hashes) before use | IMPLEMENTED | `cyberjection/hubguard/safetensors.py:HashManifest`<br>`cyberjection/hubguard/safetensors.py:compare_against_manifest`<br>`cyberjection/hubguard/client.py (git blob SHA-1 + --verify-downloads SHA-256)`<br>`cyberjection/hubguard/gate.py (cyberjection run refuses BLOCKed huggingface targets)`<br>`tests/unit/test_hubguard_client.py` | Model weights and code are pinned by SHA-256 manifests, every fetched file is checked against the Hub's Git blob id, and all reads are pinned to the resolved commit SHA. Hub repositories are not cryptographically signed, so verification is against operator-pinned hashes, not publisher signatures. |
 | ASVS-V12.1 | Path traversal is prevented on file operations driven by external input | IMPLEMENTED | `cyberjection/security/input_validation.py:assert_safe_output_path`<br>`tests/unit/test_input_validation.py` | - |
 | ASVS-V13 | API and web service security controls | PARTIAL | `cyberjection/api/asgi.py`<br>`cyberjection/api/app.py`<br>`tests/unit/test_api.py`<br>`tests/unit/test_api_persistence.py` | The REST API Phase 10 ships is intentionally minimal and read-only (5 GET endpoints, no mutation, no request body parsing -- see cyberjection/api/asgi.py's module docstring), which removes several ASVS-V13 subcontrols by construction (no injection surface via a request body, no state-changing endpoint to authorize). It does not implement authentication, rate limiting, or CORS policy -- those are left to the deployment's own reverse proxy per docs/DEPLOYMENT.md, not implemented in-app. |
 | ASVS-V14.2 | Dependencies are tracked and checked against known vulnerabilities | IMPLEMENTED | `cyberjection/security/dependency_audit.py:run_dependency_audit`<br>`.github/workflows/cyberjection.yml` | - |
@@ -65,14 +67,14 @@ leaving just the Markdown report body below).
 |---|---|---|---|---|
 | SOC2-CC6.1 | Logical access to systems and data is restricted to authorized users | PARTIAL | `cyberjection/config/schema.py (SecretStr credential handling)` | Credential handling exists; no multi-user access control model exists yet (single-operator tool). |
 | SOC2-CC6.6 | Vulnerabilities in the software supply chain are identified and addressed | IMPLEMENTED | `cyberjection/security/dependency_audit.py`<br>`.github/workflows/cyberjection.yml` | - |
-| SOC2-CC6.8 | Unauthorized or malicious changes to software are prevented or detected | PARTIAL | `cyberjection/security/secrets_audit.py`<br>`.github/workflows/cyberjection.yml (CI runs on every push/PR)` | Secret and dependency scanning run in CI; there is no code-signing or branch-protection enforcement configurable from within this repository's own tooling. |
+| SOC2-CC6.8 | Unauthorized or malicious changes to software are prevented or detected | PARTIAL | `cyberjection/security/secrets_audit.py`<br>`.github/workflows/cyberjection.yml (CI runs on every push/PR)`<br>`cyberjection/hubguard/ (model supply-chain gate, Phase 11)` | Secret and dependency scanning run in CI, and Phase 11's HubGuard gate blocks tampered or malicious third-party model artifacts before they are loaded; there is no code-signing or branch-protection enforcement configurable from within this repository's own tooling. |
 | SOC2-CC7.2 | Security events are monitored and anomalies are identified | PARTIAL | `cyberjection/security/audit_log.py` | Events are captured in a tamper-evident log; no automated alerting/anomaly-detection layer consumes it yet. |
 | SOC2-CC7.3 | Identified security events are evaluated and responded to | PARTIAL | `cyberjection/security/audit_log.py:verify_chain`<br>`docs/SECURITY.md (vulnerability disclosure process)` | A disclosure/response process is documented; response is currently a manual maintainer action, not an automated workflow. |
 | SOC2-CC8.1 | Changes to infrastructure, data, and software are authorized, tested, and approved before deployment | IMPLEMENTED | `.github/workflows/cyberjection.yml`<br>`.gitlab-ci.yml`<br>`tests/unit/ (full suite gates every change)` | - |
 
 ## Reading the PARTIAL entries
 
-Eight controls are marked `PARTIAL` rather than `IMPLEMENTED`. Each one
+Nine controls are marked `PARTIAL` rather than `IMPLEMENTED`. Each one
 has real, working evidence behind it -- the gap is between what this
 project can enforce as a library/CLI/API and what requires
 deployment-environment configuration this codebase can't control from
@@ -98,6 +100,18 @@ inside itself:
   solid, but there's no multi-user authorization model, because
   Cyberjection is still a single-operator CLI/single-tenant dashboard
   tool as of Phase 10.
+- **ASVS-V10.2** (malicious code search, new in Phase 11): HubGuard
+  scans third-party model artifacts -- pickle checkpoints statically,
+  `trust_remote_code` Python statically and (opt-in) behaviorally -- but
+  static analysis can be evaded by code it can't resolve (those cases are
+  reported as findings and fail closed), and the sandbox profiler has no
+  seccomp filter, so it is a detection layer, not a containment boundary.
+- **ASVS-V10.2** (malicious code search, new in Phase 11): HubGuard
+  scans third-party model artifacts -- pickle checkpoints statically,
+  `trust_remote_code` Python statically and (opt-in) behaviorally -- but
+  static analysis can be evaded by code it can't resolve (those cases are
+  reported as findings and fail closed), and the sandbox profiler has no
+  seccomp filter, so it is a detection layer, not a containment boundary.
 - **SOC2-CC6.8** (change control): CI-enforced secret/dependency scanning
   exists, but branch protection and code signing are GitHub/GitLab
   repository settings, not something this codebase configures for you.

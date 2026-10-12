@@ -88,8 +88,8 @@ class DistributedClusterCoordinator:
                     return data
         finally:
             await pubsub.unsubscribe(self.abort_channel)
-            await pubsub.close()
+            await pubsub.aclose()
         return None
 
     async def close(self) -> None:
-        await self.redis.close()
+        await self.redis.aclose()

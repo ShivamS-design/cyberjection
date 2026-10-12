@@ -9,7 +9,7 @@ of strings (see ``StrategyConfig.converters`` in
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Type
+from typing import Any, Callable, Dict, List, Type, TypeVar
 
 from cyberjection.mutators.base import BaseMutator, MutatorPipeline
 
@@ -19,9 +19,10 @@ class MutatorRegistrationError(Exception):
 
 
 _REGISTRY: Dict[str, Type[BaseMutator]] = {}
+_T = TypeVar("_T", bound=Type[BaseMutator])
 
 
-def register_mutator(alias: str):
+def register_mutator(alias: str) -> Callable[[_T], _T]:
     """Class decorator registering a :class:`BaseMutator` subclass under
     ``alias``. Re-registering the same class under the same alias is
     idempotent (safe under repeated module import); registering a
@@ -29,7 +30,7 @@ def register_mutator(alias: str):
     :class:`MutatorRegistrationError`.
     """
 
-    def decorator(cls: Type[BaseMutator]) -> Type[BaseMutator]:
+    def decorator(cls: _T) -> _T:
         if not (isinstance(cls, type) and issubclass(cls, BaseMutator)):
             raise MutatorRegistrationError(
                 f"Cannot register '{alias}': {cls!r} is not a BaseMutator subclass."

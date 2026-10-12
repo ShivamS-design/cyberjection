@@ -266,4 +266,4 @@ class DistributedRateLimiter:
         await asyncio.sleep(seconds)
 
     async def close(self) -> None:
-        await self.redis.close()
+        await self.redis.aclose()

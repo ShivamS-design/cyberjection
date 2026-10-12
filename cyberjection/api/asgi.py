@@ -101,6 +101,8 @@ def JSONResponse(payload: Any, *, status_code: int = 200) -> Response:
 
 
 Handler = Callable[[Request], Awaitable[Response]]
+Receive = Callable[[], Awaitable[Dict[str, Any]]]
+Send = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
 class Router:
@@ -132,10 +134,13 @@ class ASGIApp:
     this app has no startup/shutdown work to do) and `http` (routing
     through `self.router`, JSON error responses for a 404/405/500)."""
 
-    def __init__(self, router: Router) -> None:
+    def __init__(self, router: Router, *, static: Optional[Any] = None) -> None:
         self.router = router
+        # Optional `cyberjection.api.static.DashboardStatic`: serves the
+        # built dashboard for any non-`/api` path no route matched.
+        self.static = static
 
-    async def __call__(self, scope: Dict[str, Any], receive: Callable, send: Callable) -> None:
+    async def __call__(self, scope: Dict[str, Any], receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
             await self._handle_lifespan(receive, send)
             return
@@ -146,7 +151,7 @@ class ASGIApp:
             raise NotImplementedError(f"Unsupported ASGI scope type: {scope['type']!r}")
         await self._handle_http(scope, receive, send)
 
-    async def _handle_lifespan(self, receive: Callable, send: Callable) -> None:
+    async def _handle_lifespan(self, receive: Receive, send: Send) -> None:
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
@@ -155,13 +160,16 @@ class ASGIApp:
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
-    async def _handle_http(self, scope: Dict[str, Any], receive: Callable, send: Callable) -> None:
+    async def _handle_http(self, scope: Dict[str, Any], receive: Receive, send: Send) -> None:
         method = scope["method"]
         path = scope["path"]
         query_params = dict(parse_qsl((scope.get("query_string") or b"").decode("utf-8")))
 
         matched = self.router.match(method, path)
-        if matched is None:
+        is_api = path == "/api" or path.startswith("/api/")
+        if matched is None and self.static is not None and not is_api:
+            response = self.static.response_for(method, path)
+        elif matched is None:
             response = JSONResponse({"error": "not_found", "path": path}, status_code=404)
         else:
             handler, path_params = matched

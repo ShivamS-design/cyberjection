@@ -120,7 +120,10 @@ class TestParsePipAuditJSON:
 
 class TestRunDependencyAudit:
     def test_reports_unavailable_when_pip_audit_not_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import importlib.util
+
         monkeypatch.setattr(shutil, "which", lambda _name: None)
+        monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
         report = run_dependency_audit()
         assert report.source == "unavailable"
         assert report.findings == []
@@ -132,10 +135,32 @@ class TestRunDependencyAudit:
         # extras) -- exercising the real, unstubbed code path here is
         # exactly the honest-fallback behavior this module exists to
         # guarantee, not a mock standing in for it.
+        import importlib.util
+
         report = run_dependency_audit()
         assert report.source in ("unavailable", "pip-audit", "timeout", "error")
-        if shutil.which("pip-audit") is None:
+        if shutil.which("pip-audit") is None and importlib.util.find_spec("pip_audit") is None:
             assert report.source == "unavailable"
+
+    def test_finds_pip_audit_installed_beside_the_interpreter_without_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Regression: a pip-audit installed in an unactivated venv isn't on
+        # PATH, but `python -m pip_audit` with the same interpreter works.
+        import importlib.util
+        import subprocess
+        import sys
+
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "pip_audit" else None)
+        seen = {}
+
+        def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"dependencies": [{"name": "x", "version": "1", "vulns": []}]}), stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        report = run_dependency_audit()
+        assert seen["cmd"][:3] == [sys.executable, "-m", "pip_audit"]
+        assert report.source == "pip-audit" and report.packages_checked == 1
 
 
 class TestEvaluateDependencyGate:

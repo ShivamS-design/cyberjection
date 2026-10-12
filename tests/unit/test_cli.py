@@ -398,18 +398,22 @@ class TestAuditCommand:
         assert "scanning for hardcoded secrets" in result.output.lower()
 
     def test_deps_only_reports_unavailable_in_this_sandbox(self, monkeypatch, tmp_path) -> None:
-        import shutil
+        from cyberjection.security import dependency_audit
 
-        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        # Simulate pip-audit being absent (both the PATH lookup and the
+        # import-based lookup) so this doesn't depend on the environment.
+        monkeypatch.setattr(dependency_audit, "_pip_audit_command", lambda: None)
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["audit", "--deps"])
         assert result.exit_code == EXIT_OK
         assert "unavailable" in result.output.lower()
 
     def test_deps_fail_on_unavailable_fails_the_gate(self, monkeypatch, tmp_path) -> None:
-        import shutil
+        from cyberjection.security import dependency_audit
 
-        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        # Simulate pip-audit being absent (both the PATH lookup and the
+        # import-based lookup) so this doesn't depend on the environment.
+        monkeypatch.setattr(dependency_audit, "_pip_audit_command", lambda: None)
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["audit", "--deps", "--fail-on-unavailable"])
         assert result.exit_code == EXIT_QUALITY_GATE_FAILED
@@ -511,12 +515,40 @@ class TestPluginsCommand:
 
 
 class TestServeCommand:
-    def test_reports_environment_error_when_uvicorn_unavailable(self) -> None:
-        # This sandbox has no network access to install uvicorn (see
-        # pyproject.toml's optional `api` extra), so `serve` should
-        # degrade the same way `inspect` does when SQLAlchemy isn't
-        # installed -- a clear environment-error exit code, not a bare
-        # ImportError traceback.
+    def test_reports_environment_error_when_uvicorn_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `serve` should degrade the same way `inspect` does when
+        # SQLAlchemy isn't installed -- a clear environment-error exit
+        # code, not a bare ImportError traceback. uvicorn's absence is
+        # simulated (a `None` entry in sys.modules makes `import uvicorn`
+        # raise ImportError) so this test is deterministic whether or not
+        # the `api` extra is installed; previously, with uvicorn
+        # installed, it started a real server and hung the suite.
+        import sys
+
+        monkeypatch.setitem(sys.modules, "uvicorn", None)
         result = runner.invoke(app, ["serve"])
         assert result.exit_code == EXIT_ENVIRONMENT_ERROR
         assert "uvicorn" in result.output.lower()
+
+    def test_serves_with_uvicorn_when_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+        import types
+
+        calls = []
+        fake = types.ModuleType("uvicorn")
+        fake.run = lambda asgi_app, host, port: calls.append((asgi_app, host, port))  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "uvicorn", fake)
+        result = runner.invoke(app, ["serve", "--host", "127.0.0.1", "--port", "8123"])
+        assert result.exit_code == EXIT_OK, result.output
+        assert calls and calls[0][1:] == ("127.0.0.1", 8123)
+
+    def test_dashboard_dir_without_build_is_usage_error(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        import sys
+        import types
+
+        fake = types.ModuleType("uvicorn")
+        fake.run = lambda *a, **k: None  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "uvicorn", fake)
+        result = runner.invoke(app, ["serve", "--dashboard-dir", str(tmp_path)])
+        assert result.exit_code == EXIT_USAGE_ERROR
+        assert "index.html" in _strip_ansi(result.output)
