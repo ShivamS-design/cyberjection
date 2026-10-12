@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
+from cyberjection import budget
 from cyberjection.config.schema import TargetConfig
 from cyberjection.providers.base import BaseTarget
 from cyberjection.utils.exceptions import (
@@ -70,6 +71,9 @@ class UsageMetrics(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     latency_ms: float = 0.0
+    cost_usd: Optional[float] = Field(
+        default=None, description="Real cost of the call in USD, or None if it couldn't be priced."
+    )
 
 
 class TargetResponse(BaseModel):
@@ -79,6 +83,14 @@ class TargetResponse(BaseModel):
     raw_response: Dict[str, Any] = Field(default_factory=dict)
     metrics: UsageMetrics
     model_used: str
+
+
+def _litellm_model_name(config: TargetConfig) -> str:
+    """`provider/model`, without doubling a provider prefix the model id
+    already carries (`huggingface/meta-llama/...` in Phase 11 campaigns)."""
+
+    prefix = f"{config.provider.value}/"
+    return config.model if config.model.startswith(prefix) else prefix + config.model
 
 
 def _classify_exception(exc: Exception, *, target_id: str) -> Exception:
@@ -160,13 +172,15 @@ class LiteLLMTarget(BaseTarget):
         from litellm import acompletion  # imported lazily so Phase 1 tests can mock it cheaply
 
         for attempt in range(self.max_retries + 1):
+            # Outside the try: a budget stop must propagate, not be retried.
+            budget.preflight("target call")
             start_time = time.perf_counter()
             try:
                 api_key_str = (
                     self.config.api_key.get_secret_value() if self.config.api_key else None
                 )
                 response = await acompletion(
-                    model=f"{self.config.provider.value}/{self.config.model}",
+                    model=_litellm_model_name(self.config),
                     messages=messages,
                     temperature=self.config.temperature,
                     max_tokens=self.config.max_tokens,
@@ -184,7 +198,9 @@ class LiteLLMTarget(BaseTarget):
                 continue
 
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            return self._to_target_response(response, elapsed_ms)
+            target_response = self._to_target_response(response, elapsed_ms)
+            budget.record(target_response.metrics.cost_usd, "target call")
+            return target_response
 
         # Unreachable: the loop above always either returns or raises.
         raise ProviderConnectionError("Exhausted retries with no response.", target_id=self.config.id)
@@ -197,6 +213,7 @@ class LiteLLMTarget(BaseTarget):
             completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
             total_tokens=getattr(usage, "total_tokens", 0) or 0,
             latency_ms=elapsed_ms,
+            cost_usd=budget.response_cost(response, pricing=self.config.pricing),
         )
         raw_response: Dict[str, Any]
         if hasattr(response, "model_dump"):

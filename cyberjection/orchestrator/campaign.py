@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from cyberjection.attacks import registry as strategy_registry
+from cyberjection.budget import BudgetTracker, use_tracker
 from cyberjection.attacks.attacker import AttackerAgent
 from cyberjection.attacks.base import BaseStrategy, ExecutionContext
 from cyberjection.attacks.crescendo import CrescendoEngine
@@ -55,6 +56,7 @@ from cyberjection.persistence import (
 from cyberjection.providers.litellm_provider import LiteLLMTarget
 from cyberjection.reporting.models import Finding
 from cyberjection.utils.exceptions import (
+    BudgetExceededError,
     CampaignNotFoundError,
     CyberjectionException,
     ProviderError,
@@ -112,9 +114,11 @@ class TestOutcome:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     completed: bool = True
+    budget_stopped: bool = False
+    cost_usd: float = 0.0
 
 
-def _build_cascade_evaluator(assertions: List[AssertionConfig]) -> CascadeEvaluator:
+def _build_cascade_evaluator(assertions: List[AssertionConfig], *, local_only: bool = False) -> CascadeEvaluator:
     """Builds a `CascadeEvaluator` for a test case, threading its
     `llm-judge`-type assertion's `judge_model` / `rubric` /
     `confidence_threshold` (Phase 1's schema) through to Tier 3 -- the
@@ -128,6 +132,9 @@ def _build_cascade_evaluator(assertions: List[AssertionConfig]) -> CascadeEvalua
     """
 
     judge_assertion = next((a for a in assertions if a.type == AssertionType.LLM_JUDGE), None)
+    if local_only:
+        threshold = judge_assertion.confidence_threshold if judge_assertion else 0.90
+        return CascadeEvaluator(tier2_confidence_threshold=threshold, enable_tier3=False)
     if judge_assertion is None:
         return CascadeEvaluator()
 
@@ -209,6 +216,35 @@ def _verdict_from_multi_turn(nodes: List[AttackNode]) -> Tuple[Verdict, float, s
     )
 
 
+class _SerializedRepository:
+    """Serializes calls to a `CampaignRepository` shared by concurrently
+    running test cases.
+
+    The repository wraps one `AsyncSession`, and an `AsyncSession` must not
+    be used by several coroutines at once: interleaved `add()`/`commit()`
+    calls flush each other's pending rows, which surfaced as
+    `IntegrityError: UNIQUE constraint failed: tests.id` on any run with
+    persistence and more than one test case. Each repository method is a
+    complete unit of work (it commits), so running them one at a time is
+    correct; model calls, which dominate run time, stay fully concurrent.
+    """
+
+    def __init__(self, repository: CampaignRepository) -> None:
+        self._repository = repository
+        self._lock = asyncio.Lock()
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        attribute = getattr(self._repository, name)
+        if not asyncio.iscoroutinefunction(attribute):
+            return attribute
+
+        async def serialized(*args, **kwargs):  # type: ignore[no-untyped-def]
+            async with self._lock:
+                return await attribute(*args, **kwargs)
+
+        return serialized
+
+
 class CampaignOrchestrator:
     """Executes a `CampaignConfig`'s test cases against their configured
     targets through the real Phase 1-5 attack/evaluator stack.
@@ -229,10 +265,19 @@ class CampaignOrchestrator:
         repository: Optional[CampaignRepository] = None,
         resumability: Optional[ResumabilityManager] = None,
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+        budget: Optional[BudgetTracker] = None,
+        local_only: bool = False,
     ) -> None:
-        self.repository = repository
+        # Wrapped so concurrent test cases never share the session at once.
+        self.repository = _SerializedRepository(repository) if repository is not None else None
         self.resumability = resumability
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        # Campaign-wide spend tracker; created from config.max_cost_cap by
+        # run_campaign unless the caller supplies one.
+        self.budget = budget
+        # `cyberjection run --local-only`: single-turn strategies only and no
+        # remote judge, so nothing but the (local) target is ever called.
+        self.local_only = local_only
 
     async def run_campaign(
         self, config: CampaignConfig, *, campaign_row_id: Optional[str] = None
@@ -241,18 +286,18 @@ class CampaignOrchestrator:
         the constructor's `max_concurrency`) and returns one `Finding` per
         test case, in `config.tests` order.
 
-        `config.max_cost_cap` is part of the Phase 1 schema but not
-        enforced here: `cyberjection.providers.litellm_provider.UsageMetrics`
-        carries token counts, not a per-call cost figure, so there is no
-        real cost signal to check a cap against yet. Enforcing a cap
-        against a fabricated cost estimate would be worse than not
-        enforcing one at all -- see
-        `cyberjection.security.dependency_audit`'s module docstring for the
-        same "don't fabricate a number to look complete" principle applied
-        elsewhere in this codebase. `config.max_workers` is honored via
-        this instance's `max_concurrency`, set by whoever constructs the
-        orchestrator (`execute_campaign` passes `config.max_workers`
-        through directly).
+        `config.max_cost_cap` is enforced through `cyberjection.budget`:
+        every target, attacker and judge call is checked against the cap
+        before it is made and charged its real cost (from LiteLLM's pricing
+        data or the target's `pricing` block) afterwards. Once the cap is
+        reached, in-flight tests stop at their next model call and tests
+        that haven't started are skipped; their findings are marked
+        `budget_exceeded`, and `self.budget.exceeded` is set for the
+        caller. Calls whose cost can't be determined are counted, never
+        charged an invented amount -- see the `cyberjection.budget` module
+        docstring. `config.max_workers` is honored via this instance's
+        `max_concurrency`, set by whoever constructs the orchestrator
+        (`execute_campaign` passes `config.max_workers` through directly).
         """
 
         targets_by_id = {t.id: t for t in config.targets}
@@ -262,17 +307,25 @@ class CampaignOrchestrator:
         if self.resumability is not None and campaign_row_id:
             resume_map = await self.resumability.get_campaign_resume_state(campaign_row_id)
 
+        if self.budget is None:
+            self.budget = BudgetTracker(cap_usd=config.max_cost_cap or None)
+        campaign_budget = self.budget
+
         async def _bounded_run(test_case: TestCaseConfig) -> Finding:
             async with self._semaphore:
-                return await self._run_test_case(
-                    test_case,
-                    targets_by_id,
-                    strategies_by_id,
-                    campaign_row_id=campaign_row_id,
-                    resume_map=resume_map,
-                )
+                if campaign_budget.exceeded:
+                    return self._finding_for_budget_skip(test_case)
+                with use_tracker(campaign_budget.child()):
+                    return await self._run_test_case(
+                        test_case,
+                        targets_by_id,
+                        strategies_by_id,
+                        campaign_row_id=campaign_row_id,
+                        resume_map=resume_map,
+                    )
 
-        findings = await asyncio.gather(*[_bounded_run(test_case) for test_case in config.tests])
+        with use_tracker(campaign_budget):
+            findings = await asyncio.gather(*[_bounded_run(test_case) for test_case in config.tests])
         return list(findings)
 
     async def _run_test_case(
@@ -327,9 +380,20 @@ class CampaignOrchestrator:
                 resumed_state.test_id,
             )
 
+        if self.local_only and strategy_config.type in _MULTI_TURN_STRATEGY_TYPES:
+            return Finding(
+                rule_id=f"{test_case.strategy}:{test_case.name}",
+                category="skipped_local_only",
+                score=0.0,
+                details=(
+                    f"Not run: {strategy_config.type!r} is multi-turn and needs a remote attacker model; "
+                    "run without --local-only to include it."
+                ),
+            )
+
         target_config = targets_by_id[test_case.target]
         target = LiteLLMTarget(target_config)
-        evaluator = _build_cascade_evaluator(test_case.assertions)
+        evaluator = _build_cascade_evaluator(test_case.assertions, local_only=self.local_only)
 
         test_row_id: Optional[str] = None
         if self.repository is not None and campaign_row_id:
@@ -350,6 +414,15 @@ class CampaignOrchestrator:
                     f"{strategy_registry.list_strategy_aliases()}; known multi-turn types: "
                     f"{sorted(_MULTI_TURN_STRATEGY_TYPES)}"
                 )
+        except BudgetExceededError as exc:
+            outcome = TestOutcome(
+                test_case=test_case,
+                verdict=Verdict.UNCERTAIN,
+                score=0.0,
+                reason=f"Stopped by the campaign budget cap before completing: {exc}",
+                completed=False,
+                budget_stopped=True,
+            )
         except (ProviderError, CyberjectionException) as exc:
             outcome = TestOutcome(
                 test_case=test_case,
@@ -358,6 +431,12 @@ class CampaignOrchestrator:
                 reason=f"Execution failed before an evaluation could complete: {exc}",
                 completed=False,
             )
+
+        from cyberjection.budget import current_tracker
+
+        test_budget = current_tracker()
+        if test_budget is not None:
+            outcome.cost_usd = test_budget.spent_usd
 
         if self.repository is not None and test_row_id:
             for turn in outcome.turns:
@@ -368,13 +447,14 @@ class CampaignOrchestrator:
                 test_row_id,
                 outcome.verdict.value,
                 outcome.score,
-                status="COMPLETED" if outcome.completed else "FAILED",
+                status="COMPLETED" if outcome.completed else ("BUDGET_EXCEEDED" if outcome.budget_stopped else "FAILED"),
             )
-            if outcome.prompt_tokens or outcome.completion_tokens:
+            if outcome.prompt_tokens or outcome.completion_tokens or outcome.cost_usd:
                 await self.repository.upsert_metrics(
                     test_row_id,
                     prompt_tokens=outcome.prompt_tokens,
                     completion_tokens=outcome.completion_tokens,
+                    total_cost=round(outcome.cost_usd, 6),
                 )
 
         return self._to_finding(test_case, outcome)
@@ -416,21 +496,28 @@ class CampaignOrchestrator:
         goal = test_case.metadata.get("goal", test_case.seed_prompt)
 
         if strategy_config.type == "crescendo":
-            engine = CrescendoEngine(
+            crescendo = CrescendoEngine(
                 evaluator=evaluator, attacker=attacker, max_turns=strategy_config.max_turns
             )
             nodes: List[AttackNode] = []
-            async for node in engine.run(target, goal=goal, initial_prompt=test_case.seed_prompt):
+            async for node in crescendo.run(target, goal=goal, initial_prompt=test_case.seed_prompt):
                 nodes.append(node)
         else:  # "tap" -- the only other member of _MULTI_TURN_STRATEGY_TYPES
-            engine = TAPEngine(evaluator=evaluator, attacker=attacker)
-            nodes = await engine.execute_tree_search(target, goal=goal, seed_prompt=test_case.seed_prompt)
+            tap = TAPEngine(evaluator=evaluator, attacker=attacker)
+            nodes = await tap.execute_tree_search(target, goal=goal, seed_prompt=test_case.seed_prompt)
 
         verdict, score, reason = _verdict_from_multi_turn(nodes)
         turns = [TurnRecord(index + 1, node.prompt, node.response) for index, node in enumerate(nodes)]
         return TestOutcome(test_case=test_case, verdict=verdict, score=score, reason=reason, turns=turns)
 
     def _to_finding(self, test_case: TestCaseConfig, outcome: TestOutcome) -> Finding:
+        if outcome.budget_stopped:
+            return Finding(
+                rule_id=f"{test_case.strategy}:{test_case.name}",
+                category="budget_exceeded",
+                score=0.0,
+                details=outcome.reason,
+            )
         return Finding(
             rule_id=f"{test_case.strategy}:{test_case.name}",
             category=test_case.owasp_category or test_case.strategy,
@@ -444,6 +531,15 @@ class CampaignOrchestrator:
             category=test_case.owasp_category or test_case.strategy,
             score=round(resumed_state.score, 2),
             details=f"Skipped: already completed in a prior run (verdict={resumed_state.verdict}).",
+        )
+
+    def _finding_for_budget_skip(self, test_case: TestCaseConfig) -> Finding:
+        spent = self.budget.spent_usd if self.budget else 0.0
+        return Finding(
+            rule_id=f"{test_case.strategy}:{test_case.name}",
+            category="budget_exceeded",
+            score=0.0,
+            details=f"Not run: the campaign budget cap was reached (spent ${spent:.4f}) before this test started.",
         )
 
     def _finding_for_configuration_error(self, test_case: TestCaseConfig, message: str) -> Finding:
@@ -461,6 +557,7 @@ async def execute_campaign(
     db_url: Optional[str] = None,
     resume_campaign_id: Optional[str] = None,
     max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+    local_only: bool = False,
 ) -> List[Finding]:
     """High-level entrypoint `cyberjection.cli.main._execute_pipeline`
     calls: opens the persistence layer when SQLAlchemy is installed,
@@ -484,8 +581,12 @@ async def execute_campaign(
                 f"{resume_campaign_id!r}: the persistence layer (SQLAlchemy/aiosqlite) isn't "
                 "installed in this environment, so no campaign history exists to resume from."
             )
-        orchestrator = CampaignOrchestrator(repository=None, resumability=None, max_concurrency=max_concurrency)
-        return await orchestrator.run_campaign(config)
+        orchestrator = CampaignOrchestrator(
+            repository=None, resumability=None, max_concurrency=max_concurrency, local_only=local_only
+        )
+        findings = await orchestrator.run_campaign(config)
+        _raise_if_budget_exceeded(orchestrator, findings)
+        return findings
 
     from cyberjection.persistence import DatabaseManager
 
@@ -510,14 +611,38 @@ async def execute_campaign(
 
             await repository.update_campaign_status(campaign_row_id, "RUNNING")
             orchestrator = CampaignOrchestrator(
-                repository=repository, resumability=resumability, max_concurrency=max_concurrency
+                repository=repository,
+                resumability=resumability,
+                max_concurrency=max_concurrency,
+                local_only=local_only,
             )
             try:
                 findings = await orchestrator.run_campaign(config, campaign_row_id=campaign_row_id)
             except Exception:
                 await repository.update_campaign_status(campaign_row_id, "FAILED")
                 raise
-            await repository.update_campaign_status(campaign_row_id, "COMPLETED")
+            spent = orchestrator.budget.spent_usd if orchestrator.budget else 0.0
+            exceeded = bool(orchestrator.budget and orchestrator.budget.exceeded)
+            await repository.update_campaign_status(
+                campaign_row_id, "BUDGET_EXCEEDED" if exceeded else "COMPLETED", total_cost=round(spent, 6)
+            )
+            _raise_if_budget_exceeded(orchestrator, findings)
             return findings
     finally:
         await manager.close()
+
+
+def _raise_if_budget_exceeded(orchestrator: CampaignOrchestrator, findings: List[Finding]) -> None:
+    """Surfaces a budget stop to the caller *after* the run has wound down
+    (and persistence is up to date), carrying the findings that were
+    produced so reports can still be written."""
+
+    tracker = orchestrator.budget
+    if tracker is not None and tracker.exceeded:
+        raise BudgetExceededError(
+            f"Campaign stopped at its budget cap of ${tracker.cap_usd:.4f} "
+            f"(spent ${tracker.spent_usd:.4f} across {tracker.priced_calls} priced call(s)).",
+            spent_usd=tracker.spent_usd,
+            cap_usd=tracker.cap_usd,
+            findings=findings,
+        )

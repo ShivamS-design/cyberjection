@@ -1,6 +1,6 @@
 {
   "name": "cyberjection-dashboard",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "private": true,
   "description": "Phase 10 web dashboard for Cyberjection: browses persisted campaign/test history and registered plugins via the cyberjection.api REST backend.",
   "type": "module",
@@ -13,13 +13,13 @@
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.0"
+    "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@vitejs/plugin-react": "^6.1.2",
     "typescript": "^5.5.4",
-    "vite": "^5.4.0"
+    "vite": "^8.3.4"
   }
 }

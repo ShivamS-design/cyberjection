@@ -10,7 +10,7 @@ at most the in-flight operation, not an unbounded batch of prior work.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,10 +74,10 @@ class CampaignRepository:
     async def update_campaign_status(
         self, campaign_id: str, status: str, *, total_cost: Optional[float] = None
     ) -> None:
-        values: dict = {"status": status}
+        values: Dict[str, Any] = {"status": status}
         if total_cost is not None:
             values["total_cost"] = total_cost
-        if status in ("COMPLETED", "FAILED", "INTERRUPTED"):
+        if status in ("COMPLETED", "FAILED", "INTERRUPTED", "BUDGET_EXCEEDED"):  # terminal states
             values["finished_at"] = utc_now()
         stmt = update(CampaignModel).where(CampaignModel.id == campaign_id).values(**values)
         await self.session.execute(stmt)

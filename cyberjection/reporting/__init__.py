@@ -21,10 +21,12 @@ from cyberjection.reporting.registry import (
     register_exporter,
 )
 from cyberjection.reporting.sarif import SARIFReporter
+from cyberjection.reporting.owasp_llm import OWASPLLMReporter  # registers the "owasp-llm" exporter
 
 __all__ = [
     "Finding",
     "QualityGateResult",
+    "OWASPLLMReporter",
     "SARIFReporter",
     "JSONExporter",
     "MarkdownExporter",

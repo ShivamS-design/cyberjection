@@ -29,7 +29,7 @@ registered here: they aren't `BaseStrategy` subclasses (see
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Type
+from typing import Any, Callable, Dict, List, Type, TypeVar
 
 from cyberjection.attacks.base import BaseStrategy
 
@@ -39,9 +39,10 @@ class StrategyRegistrationError(Exception):
 
 
 _REGISTRY: Dict[str, Type[BaseStrategy]] = {}
+_T = TypeVar("_T", bound=Type[BaseStrategy])
 
 
-def register_strategy(alias: str):
+def register_strategy(alias: str) -> Callable[[_T], _T]:
     """Class decorator registering a :class:`BaseStrategy` subclass under
     ``alias``. Re-registering the same class under the same alias is
     idempotent (safe under repeated module import, and lets one class
@@ -51,7 +52,7 @@ def register_strategy(alias: str):
     :class:`StrategyRegistrationError`.
     """
 
-    def decorator(cls: Type[BaseStrategy]) -> Type[BaseStrategy]:
+    def decorator(cls: _T) -> _T:
         if not (isinstance(cls, type) and issubclass(cls, BaseStrategy)):
             raise StrategyRegistrationError(
                 f"Cannot register '{alias}': {cls!r} is not a BaseStrategy subclass."

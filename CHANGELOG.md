@@ -2,6 +2,179 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.12.0] - Industry readiness
+
+### Fixed
+
+- **`max_cost_cap` was never enforced.** New `cyberjection.budget` checks
+  the cap before every target, attacker and judge call and charges real
+  cost afterwards (LiteLLM pricing data, or a target's new `pricing`
+  block). Unpriceable calls are counted, never guessed. A budget stop
+  skips unstarted tests, persists `BUDGET_EXCEEDED` with total cost, and
+  makes `cyberjection run` exit 5 after writing its reports.
+- **LLM judge prompt injection.** Attack prompts and target responses are
+  wrapped in per-call random-nonce tags with untrusted-data rules, and a
+  manipulation tripwire downgrades a fooled "not jailbroken" verdict to
+  UNCERTAIN.
+- **Crash on any persisted run with more than one test**
+  (`UNIQUE constraint failed: tests.id`): concurrent test cases shared one
+  AsyncSession. Repository calls are now serialized; model calls stay
+  concurrent. Present on `main` before this release.
+- SSRF guard bypasses (trailing dots, `*.localhost`, decimal/hex/octal/short
+  IPv4, IPv4-mapped IPv6, unspecified addresses).
+- API 500 responses no longer return exception text (logged with an
+  incident id instead).
+- `/api/plugins` imported third-party plugins on every request.
+- `hubguard file` blocked non-model files (e.g. a README); it now scans
+  recognized model formats by extension or magic bytes and skips the rest.
+- Budget-stopped campaigns now get a finish time.
+- `listen_for_aborts` was annotated as returning `None` but returns the
+  abort message; the whole package is now mypy-strict clean.
+- Rate limiter: SHA-1 marked `usedforsecurity=False`; startup assert
+  replaced by an explicit check.
+
+### Added
+
+- `cyberjection run --local-only`: local targets only, single-turn
+  strategies, no remote judge; for pre-commit hooks.
+- OWASP Top 10 for LLM Applications (2025) coverage report
+  (`--format owasp-llm`).
+- Optional API bearer-token auth (`CYBERJECTION_API_TOKEN` /
+  `--api-token`), with a warning when serving beyond loopback without it.
+- Optional HMAC-keyed audit log (`CYBERJECTION_AUDIT_KEY`) and
+  `cyberjection audit --verify-log`.
+- `.pre-commit-hooks.yaml`, a GitHub Action (`action.yml`), GitLab CI
+  templates, and a scheduled compliance workflow example.
+- `cyberjection --version`; version single-sourced from package metadata.
+- Packaging: PyPI metadata and URLs, `py.typed`, sdist contents,
+  `uv.lock`, dashboard `package-lock.json`.
+- CI: Python 3.12 and 3.13 matrix with a coverage floor, ruff + mypy +
+  lockfile check, dashboard `npm ci`/`npm audit`/build, wheel build and
+  clean-install smoke test, all actions pinned to commit SHAs with
+  read-only default permissions; Dependabot; trusted-publishing release
+  workflow.
+- An end-to-end test suite that drives the real CLI over HTTP against an
+  OpenAI-compatible server (target, attacker and judge).
+
+### Changed
+
+- Dashboard: React Router 6 -> 7 (clears two moderate advisories).
+- Ruff policy pinned in `pyproject.toml` (correctness and security rules).
+
+## [0.11.0] - Phase 11: HubGuard & Model Supply Chain Security
+
+### Added
+
+- `cyberjection/hubguard/` (new package), a model supply-chain auditor
+  for Hugging Face repositories and local snapshots:
+  `HubGuardClient.audit_repository()` returns a `HubGuardReport` with a
+  `PASS`/`WARN`/`BLOCK` verdict, a 0-10 risk score and typed findings.
+  - `picklescan.py`: static opcode scanning of pickle, PyTorch ZIP and
+    legacy, `.npy` and `.npz` files, with a symbolic stack/memo for
+    `STACK_GLOBAL`, dotted-name and Python 2 alias handling, nested and
+    base64-encoded pickle recursion, and AST analysis of embedded code.
+    Unresolvable imports fail closed.
+  - `remotecode.py`: AST analysis of `trust_remote_code` Python, recursive
+    analysis of `exec`/`eval` payloads, and `auto_map` parsing, including
+    cross-repository (`org/repo--module.Class`) references.
+  - `sandbox.py`: an opt-in behavioral profiler. It uses PEP 578 audit
+    hooks (deny + record), an isolated interpreter with an empty
+    environment, POSIX rlimits, and a network namespace where available.
+  - `safetensors.py`: `EnforcementLevel` STRICT/WARN/OFF policy, strict
+    header validation (rejects duplicate JSON keys, which the reference
+    loader accepts), `HashManifest`, SHA-256 and Git blob SHA-1 helpers.
+  - `secrets.py`: credential, webhook, database-URL and internal-endpoint
+    detection in model cards, configs, commit messages and earlier
+    revisions.
+  - `weightscan.py`: tensor statistics without a framework, embedding-norm
+    trigger candidates (optional NumPy), and `TriggerProbe`, a differential
+    backdoor-trigger probe over any Phase 1 `BaseTarget`.
+  - `transport.py`: a stdlib-only HTTP transport with Range requests,
+    CDN-URL caching and host-scoped tokens, plus a local snapshot
+    transport. `gate.py`: campaign-level enforcement.
+- Campaign schema: an optional top-level `hubguard:` section
+  (`HubGuardConfig`), `ProviderType.HUGGINGFACE`, and `TargetConfig`
+  `trust_remote_code` / `revision`. Policy violations that need no
+  network access (remote code a policy forbids, organizations outside
+  the allowlist) fail at config load.
+- CLI: a `cyberjection hubguard` group (`scan`, `gate`, `file`,
+  `manifest`), plus a supply-chain gate inside `cyberjection run` for
+  `huggingface` targets. New exit code `4` (`EXIT_SUPPLY_CHAIN_BLOCKED`).
+- `examples/hubguard_campaign.yaml`; a `weights` optional extra (NumPy).
+  `numpy` and `safetensors` were added to `dev` so the reference-loader
+  differential tests run in CI.
+- Compliance: new ASVS-V10.2 (PARTIAL) and ASVS-V10.3 (IMPLEMENTED)
+  controls, and HubGuard evidence on SOC2-CC6.8.
+- 324 new unit tests, including tests against a fake Hub HTTP server and
+  sandbox tests that verify real side effects never happen.
+
+### Removed
+
+- All Docker artifacts: `Dockerfile`, `docker-compose.yml`, `.dockerignore`,
+  `apps/dashboard/Dockerfile`, `apps/dashboard/.dockerignore` and the
+  dashboard's `nginx.conf`. The GitHub Actions workflow no longer starts a
+  Redis service container or rewrites `/etc/hosts`.
+
+### Added (deployment and test infrastructure)
+
+- `cyberjection serve --dashboard-dir` (or `CYBERJECTION_DASHBOARD_DIR`)
+  serves the built web dashboard from the same process and origin as the
+  API (`cyberjection/api/static.py`). It provides SPA fallback, JSON 404s
+  for unknown `/api/` paths, traversal and symlink-escape protection,
+  security headers, and correct JavaScript content types on Windows. This
+  replaces the nginx container.
+- `tests/conftest.py`: an autouse `_redis_backend` fixture runs the Phase
+  7 distributed tests against in-memory `fakeredis` servers (the rate
+  limiter's real Lua script included), or against a real server when
+  `CYBERJECTION_TEST_REDIS_URL` is set. `fakeredis[lua]` was added to the
+  `dev` extra.
+
+### Fixed (found by this release's audit)
+
+- **Markup injection in CLI output.** Untrusted text -- model repository
+  content, finding descriptions, error messages -- was passed to Rich as
+  markup. A repository containing `[/bold]` crashed `hubguard scan` with
+  `MarkupError`, and crafted tags could restyle output. Every
+  interpolated value is now escaped.
+- **pip-audit not found in unactivated virtualenvs.** `cyberjection audit
+  --deps` looked for `pip-audit` only on `PATH`, so a correctly installed
+  copy was reported missing (failing the CI gate under
+  `--fail-on-unavailable`), and a different environment's `pip-audit` on
+  `PATH` could audit the wrong packages. It now runs `python -m pip_audit`
+  with the current interpreter first.
+- **19 Phase 7 tests could not pass without external infrastructure.**
+  They depended on a Redis server plus `/etc/hosts` aliases for fake
+  hostnames. They now run self-contained (see above).
+- **`test_cli.py::TestServeCommand` hung the suite** when `uvicorn` was
+  installed, because it really started a server. It now simulates
+  absence deterministically, and a new test covers the installed path.
+  Two `audit --deps` tests had the same environment dependence on
+  pip-audit's absence and were fixed the same way.
+- **Legacy PyTorch false positives in HubGuard.** Raw tensor bytes after
+  the five pickles `torch.load` reads could be misparsed as opcodes. The
+  scan now stops where torch stops, and discards anything recorded while
+  misreading trailing binary data.
+- The documented `mypy` command (README "Testing") now passes; it
+  reported 17 errors before. Invisible zero-width-space literals in source
+  were replaced with `\u200b` escapes.
+
+### Fixed (HubGuard integration)
+
+- `LiteLLMTarget` no longer doubles the provider prefix when a model id
+  already carries it (`huggingface/huggingface/...`).
+
+### Verified against the live Hub
+
+- `ykilcher/totally-harmless-model` (a public malicious-pickle
+  demonstration) is BLOCKed with CRITICAL findings, and the report
+  decodes its `exec` payload.
+- `hf-internal-testing/tiny-random-gpt2` and
+  `hf-internal-testing/test_dynamic_model` produce no pickle findings
+  (real `torch.save` output fits the allowlist), are flagged only by the
+  STRICT format policy, and have their remote code and `auto_map`
+  resolved. `--verify-downloads` hashes match the Hub's LFS metadata and
+  a generated manifest.
+
 ## [0.10.0] - Phase 10: Plugin Architecture, Web Dashboard, Container Deployment
 
 No PDF design spec exists for this phase either; scope was self-authored

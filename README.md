@@ -4,7 +4,10 @@ Cyberjection is an enterprise-grade, asynchronous LLM red-teaming and
 security orchestration framework. It automates adversarial prompt
 execution, multi-turn stateful attacks, and cost-efficient safety
 evaluation against large language models, RAG pipelines, and autonomous
-agents.
+agents -- and, since Phase 11, vets model repositories for supply-chain
+attacks (malicious pickles, `trust_remote_code` payloads, tampered
+weights, leaked credentials, backdoor triggers) before a single weight
+is loaded or a prompt is sent.
 
 Full documentation lives in [`docs/`](docs/):
 
@@ -13,12 +16,12 @@ Full documentation lives in [`docs/`](docs/):
 - [Testing guide](docs/TESTING.md) - running and extending the test suite
 - [Security policy](docs/SECURITY.md) - hardening controls and vulnerability disclosure
 - [Compliance self-assessment](docs/COMPLIANCE.md) - OWASP ASVS 4.0 / SOC 2 control mapping
-- [Deployment guide](docs/DEPLOYMENT.md) - running the dashboard API/web dashboard, with or without Docker
+- [Deployment guide](docs/DEPLOYMENT.md) - running the dashboard API and web dashboard
 - [Changelog](CHANGELOG.md) - release notes per phase
 
 ## Status
 
-All 10 phases of the project roadmap are implemented: **Core Async
+All 11 phases of the project roadmap are implemented: **Core Async
 Architecture, Declarative Configuration & Target Abstraction Gateway**,
 **Mutation Engine & Single-Turn Attack Generators**, **3-Tier Cascade
 Evaluation Pipeline**, **Persistence Layer, Database Models & Resumability
@@ -26,9 +29,10 @@ Engine**, **Stateful Multi-Turn Adaptive Attack Engine**, **CI/CD
 Pipeline Integration, CLI Harness & Enterprise Reporting**,
 **Distributed Worker Architecture, Task Queues & Rate Limiting Engine**,
 **Security Auditing, Compliance & Production Hardening**, **Orchestrator**,
-and **Plugin Architecture, Web Dashboard & Container Deployment**. See
+**Plugin Architecture & Web Dashboard**, and
+**HubGuard & Model Supply Chain Security**. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#roadmap) for the full
-10-phase plan and what shipped in each stage.
+11-phase plan and what shipped in each stage.
 
 ## Features
 
@@ -194,7 +198,7 @@ and **Plugin Architecture, Web Dashboard & Container Deployment**. See
   strategy) downgrades to an `UNCERTAIN`, incomplete finding rather than
   aborting the rest of the campaign.
 
-### Phase 10: plugin architecture, web dashboard & container deployment
+### Phase 10: plugin architecture & web dashboard
 
 - Third-party plugin discovery (`cyberjection.plugins.discover_plugins`)
   via Python packaging entry points across four groups (mutators,
@@ -210,11 +214,74 @@ and **Plugin Architecture, Web Dashboard & Container Deployment**. See
 - A Vite + React + TypeScript web dashboard (`apps/dashboard/`): campaign
   list, campaign detail, full conversation-transcript test detail, and a
   plugins page.
-- Multi-stage container images (`Dockerfile`, `apps/dashboard/Dockerfile`)
-  and a `docker-compose.yml` for the "single trusted team, one instance"
-  deployment model documented in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+- `cyberjection serve --dashboard-dir apps/dashboard/dist` serves the API
+  and the built dashboard from one process and one origin, for the
+  "single trusted team, one instance" deployment model documented in
+  [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). (Container images shipped in
+  0.10.0 were removed in 0.11.0.)
+
+### Phase 11: HubGuard & model supply chain security
+
+- `cyberjection.hubguard.HubGuardClient.audit_repository()` vets a Hugging
+  Face repository (or a local snapshot) and returns one `PASS`/`WARN`/
+  `BLOCK` verdict with a 0-10 risk score. It never loads a model and
+  never unpickles anything.
+- **Pickle opcode scanning** of `.bin`/`.pt`/`.ckpt`/`.pkl`/`.npy`/`.npz`:
+  PyTorch ZIP and legacy formats are unwrapped, `STACK_GLOBAL` operands
+  are resolved through a symbolic stack and memo, and dotted-name and
+  Python 2 alias evasions are handled. Unresolvable imports fail closed.
+  Embedded or base64-encoded code is decoded and analyzed. For PyTorch
+  ZIPs, only `data.pkl` is fetched, via HTTP Range requests.
+- **Remote code analysis**: AST analysis of every `.py` file (process,
+  network, filesystem, credential access, obfuscated `exec`), plus
+  `auto_map` resolution that flags code pulled from *other*
+  repositories. As an opt-in, a sandbox profiler imports the code in a
+  restricted interpreter that denies and records process, network, write
+  and native-code operations.
+- **SafeTensors enforcement**: a STRICT/WARN/OFF SafeTensors-only policy
+  and strict header validation. It matches the reference loader's checks
+  and also rejects duplicate JSON keys, which the reference loader
+  silently accepts.
+- **Integrity**: SHA-256 hash manifests (`cyberjection hubguard
+  manifest`), Git blob SHA-1 checks on every fetched file, optional
+  full-download hash verification, and reads pinned to the resolved
+  commit SHA.
+- **Secret leak detection** in model cards, configs, commit messages and
+  *earlier revisions*, because "deleted" secrets remain downloadable from
+  Git history.
+- **Weight checks** (opt-in): non-finite and outlier tensors, and
+  embedding-norm outliers nominated as trigger candidates for a
+  differential **backdoor trigger probe** run through any Phase 1
+  target.
+- A campaign `hubguard:` section makes `cyberjection run` refuse to start
+  against a `BLOCK`ed `huggingface` target (exit code 4).
+
+### 0.12.0: industry readiness
+
+- **Enforced budget caps**: `max_cost_cap` now really stops spend across
+  target, attacker and judge calls (exit code 5, reports still written).
+- **Judge hardening**: nonce-tagged untrusted content plus a manipulation
+  tripwire, so a target response can't talk the LLM judge into a PASS.
+- **`cyberjection run --local-only`**: zero-cost, nothing-leaves-the-machine
+  checks for pre-commit hooks.
+- **OWASP Top 10 for LLM Applications (2025)** coverage report
+  (`--format owasp-llm`).
+- **Integrations**: pre-commit hooks, a GitHub Action (`action.yml`),
+  GitLab CI templates, and a scheduled compliance example.
+- **Hardening**: optional API bearer token, HMAC-keyed audit log
+  (`audit --verify-log`), stricter SSRF guard, no exception text in API
+  errors, and a fix for a crash when concurrent tests persisted results.
+- **Packaging**: PyPI-ready metadata, `cyberjection --version`, typed
+  package (`py.typed`), lockfiles, SHA-pinned CI, Dependabot, and a
+  trusted-publishing release workflow.
 
 ## Installation
+
+```bash
+pip install cyberjection            # once published to PyPI
+```
+
+From source:
 
 ```bash
 python3.12 -m venv .venv
@@ -345,7 +412,8 @@ cyberjection run \
   --sarif-out results.sarif \
   --json-out results.json
 # exits 0 (pass), 1 (quality gate failed), 2 (usage/config error),
-# or 3 (a command's runtime dependency isn't installed)
+# 3 (a runtime dependency isn't installed), 4 (HubGuard blocked the
+# target) or 5 (max_cost_cap reached; reports are still written)
 
 cyberjection inspect --limit 5     # browse recent persisted campaigns
 cyberjection export --from-json results.json --output results.md --format markdown
@@ -369,19 +437,87 @@ List registered plugins and serve the dashboard API:
 cyberjection plugins   # every registered mutator/strategy/evaluator/exporter alias
 
 pip install -e ".[api]"   # installs uvicorn
-cyberjection serve --host 0.0.0.0 --port 8000
+cyberjection serve --host 127.0.0.1 --port 8000
 ```
 
-Then, from `apps/dashboard/`, run `npm install && npm run dev` (or use
-`docker compose up --build` from the repo root for the full containerized
-stack) -- see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for details.
+Fast local check before committing (no cost, nothing leaves the machine):
+
+```bash
+cyberjection run --config cyberjection.yaml --target local-model --local-only
+```
+
+or as a pre-commit hook:
+
+```yaml
+repos:
+  - repo: https://github.com/ShivamS-design/cyberjection
+    rev: v0.12.0
+    hooks:
+      - id: cyberjection-hubguard
+      - id: cyberjection-local
+        args: [--config, cyberjection.yaml, --target, local-model]
+```
+
+In GitHub Actions:
+
+```yaml
+- uses: ShivamS-design/cyberjection@v0.12.0
+  with:
+    command: run
+    config: cyberjection.yaml
+    target: support-agent
+```
+
+OWASP Top 10 for LLM Applications coverage from a run's JSON:
+
+```bash
+cyberjection export --from-json results.json --format owasp-llm --output owasp.md
+```
+
+Audit a model repository's supply chain before deploying it (Phase 11):
+
+```bash
+cyberjection hubguard scan meta-llama/Llama-3-8B-Instruct --block-remote-code   --allow-org meta-llama --sarif-out hubguard.sarif   # gated repos need HF_TOKEN
+cyberjection hubguard manifest meta-llama/Llama-3-8B-Instruct --out pins.yaml
+cyberjection hubguard scan meta-llama/Llama-3-8B-Instruct --manifest pins.yaml --verify-downloads
+cyberjection hubguard file ./downloads/pytorch_model.bin   # local files, never loaded
+cyberjection hubguard gate -c examples/hubguard_campaign.yaml
+# exits 0 (PASS/WARN), 4 (BLOCK), or 2 (usage error)
+```
+
+```python
+import asyncio
+from cyberjection.hubguard.client import HubGuardClient
+from cyberjection.hubguard.safetensors import EnforcementLevel
+
+async def main():
+    scanner = HubGuardClient(
+        repo_id="suspicious-org/custom-llama-3-weights",
+        safetensors_policy=EnforcementLevel.STRICT,
+        scan_remote_code=True,
+        scan_pickles=True,
+    )
+    report = await scanner.audit_repository()
+    print(f"Repository: {report.repo_id}")
+    print(f"Safety Verdict: {report.verdict.value}")
+    print(f"Risk Score: {report.risk_score}/10")
+    for finding in report.findings:
+        print(f"[{finding.severity.value.upper()}] {finding.category.value}: {finding.description}")
+
+asyncio.run(main())
+```
+
+To serve the web dashboard too, build it once (`cd apps/dashboard && npm
+install && npm run build`) and add `--dashboard-dir apps/dashboard/dist`
+to `cyberjection serve`; the dashboard and the API then share one origin.
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for details.
 
 ## Project layout
 
 ```
 cyberjection/
 ├── cyberjection/
-│   ├── cli/             # main.py (Typer app: run, inspect, export, plugins, serve)
+│   ├── cli/             # main.py (Typer app: run, inspect, export, audit, plugins, serve, hubguard)
 │   ├── config/          # schema.py, loader.py
 │   ├── providers/       # base.py, litellm_provider.py
 │   ├── mutators/        # base.py, registry.py, base64_mutator.py, unicode_mutator.py,
@@ -397,10 +533,12 @@ cyberjection/
 │   │                    # dependency_audit.py, compliance.py
 │   ├── orchestrator/    # campaign.py
 │   ├── plugins/         # base.py, loader.py, registry.py
-│   ├── api/             # asgi.py, app.py, server.py
+│   ├── api/             # asgi.py, app.py, server.py, static.py
+│   ├── hubguard/        # client.py, picklescan.py, remotecode.py, sandbox.py, safetensors.py,
+│   │                    # secrets.py, weightscan.py, transport.py, models.py, gate.py
 │   └── utils/           # exceptions.py, context.py
 ├── apps/
-│   └── dashboard/       # Vite + React + TypeScript web dashboard, Dockerfile, nginx.conf
+│   └── dashboard/       # Vite + React + TypeScript web dashboard
 ├── alembic/
 │   ├── env.py
 │   ├── script.py.mako
@@ -409,14 +547,13 @@ cyberjection/
 │   └── cyberjection.yml  # CI/CD security evaluation gate
 ├── .gitlab-ci.yml        # GitLab CI equivalent
 ├── examples/
-│   └── quickstart.yaml
+│   ├── quickstart.yaml
+│   └── hubguard_campaign.yaml
 ├── tests/
 │   └── unit/
 ├── docs/
 ├── .env.example
 ├── alembic.ini
-├── Dockerfile             # API/CLI container image
-├── docker-compose.yml     # single-instance API + dashboard (+ optional redis) stack
 └── pyproject.toml
 ```
 
@@ -424,7 +561,7 @@ cyberjection/
 
 ```bash
 pytest tests/unit/ -v
-mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/ cyberjection/plugins/ cyberjection/api/
+mypy cyberjection/config/ cyberjection/providers/ cyberjection/mutators/ cyberjection/attacks/ cyberjection/evaluators/ cyberjection/plugins/ cyberjection/api/ cyberjection/hubguard/
 pytest tests/unit/ --cov=cyberjection --cov-report=term-missing
 ```
 

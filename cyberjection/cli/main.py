@@ -12,6 +12,10 @@ Phase 10 adds `plugins` (lists every registered mutator/strategy/evaluator/
 exporter alias, discovering third-party ones via
 `cyberjection.plugins.loader`) and `serve` (runs the dashboard API from
 `cyberjection.api` under `uvicorn`, for `apps/dashboard` to talk to).
+Phase 11 adds the `hubguard` command group (`scan`, `gate`, `file`,
+`manifest`) for model supply-chain auditing, and makes `run` audit a
+`huggingface` target under the campaign's `hubguard:` policy before any
+prompt is sent.
 
 Built on `typer` (declarative commands) and `rich` (table/console
 rendering) per Task 6.1 of the Phase 6 design spec; both were already
@@ -25,14 +29,16 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from cyberjection.config.loader import load_config
-from cyberjection.config.schema import CampaignConfig, TargetConfig
+from cyberjection.config.schema import CampaignConfig, ProviderType, TargetConfig
+from cyberjection.hubguard.transport import HubAccessError
 from cyberjection.orchestrator import execute_campaign
 from cyberjection.plugins import discover_plugins, known_aliases_by_group
 from cyberjection.reporting import (
@@ -45,7 +51,8 @@ from cyberjection.reporting import (
     resolve_threshold,
 )
 from cyberjection.reporting import registry as exporter_registry
-from cyberjection.security.audit_log import AuditLogger
+from cyberjection.security.audit_log import AuditLogger, verify_chain
+from cyberjection.security.audit_log import key_from_env as audit_key_from_env
 from cyberjection.security.compliance import compliance_summary, generate_compliance_report
 from cyberjection.security.dependency_audit import evaluate_dependency_gate, run_dependency_audit
 from cyberjection.security.input_validation import assert_safe_output_path, assert_safe_target_url
@@ -53,7 +60,10 @@ from cyberjection.security.secrets_audit import (
     scan_campaign_config_for_hardcoded_secrets,
     scan_paths_for_secrets,
 )
+if TYPE_CHECKING:
+    from cyberjection.hubguard.models import HubGuardReport
 from cyberjection.utils.exceptions import (
+    BudgetExceededError,
     CampaignNotFoundError,
     ConfigValidationError,
     PathTraversalError,
@@ -68,11 +78,32 @@ app = typer.Typer(
 )
 console = Console()
 
+
+def _print_version(value: bool) -> None:
+    if value:
+        from cyberjection import __version__
+
+        console.print(f"cyberjection {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False, "--version", callback=_print_version, is_eager=True, help="Show the version and exit."
+    ),
+) -> None:
+    """Enterprise AI Security & Guardrail Evaluation Harness."""
+
 # Overridable so a deployment can point audit logs at a durable/shared
 # location; defaults alongside the SQLite results DB's own default
 # directory, matching the `.cyberjection/` convention `DatabaseManager`
 # already established.
-_audit_logger = AuditLogger(os.environ.get("CYBERJECTION_AUDIT_LOG", ".cyberjection/audit.jsonl"))
+# CYBERJECTION_AUDIT_KEY (optional) turns the hash chain into an HMAC chain
+# that can't be recomputed by someone who can only write the log file.
+_audit_logger = AuditLogger(
+    os.environ.get("CYBERJECTION_AUDIT_LOG", ".cyberjection/audit.jsonl"), key=audit_key_from_env()
+)
 
 # Exit codes, documented once here rather than as magic numbers scattered
 # through each command: 0 success, 1 a quality-gate failure (the run
@@ -85,6 +116,12 @@ EXIT_OK = 0
 EXIT_QUALITY_GATE_FAILED = 1
 EXIT_USAGE_ERROR = 2
 EXIT_ENVIRONMENT_ERROR = 3
+# Phase 11: a HubGuard supply-chain audit returned BLOCK. Distinct from 1
+# so CI can tell "the model misbehaved" from "the model was never loaded".
+EXIT_SUPPLY_CHAIN_BLOCKED = 4
+# The campaign hit max_cost_cap before finishing. Reports still cover the
+# tests that ran, but a partial run must never look like a clean pass.
+EXIT_BUDGET_EXCEEDED = 5
 
 
 def _safe_output_path(path: Path) -> Path:
@@ -100,7 +137,7 @@ def _safe_output_path(path: Path) -> Path:
     try:
         return assert_safe_output_path(path, base_dir=Path.cwd())
     except PathTraversalError as exc:
-        console.print(f"[bold red]Unsafe report path:[/bold red] {exc}")
+        console.print(f"[bold red]Unsafe report path:[/bold red] {escape(str(exc))}")
         _audit_logger.log("cli.output_path_rejected", resource=str(path), outcome="denied")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
@@ -121,6 +158,7 @@ async def _execute_pipeline(
     *,
     db_url: Optional[str] = None,
     resume_campaign_id: Optional[str] = None,
+    local_only: bool = False,
 ) -> List[Finding]:
     """Runs `config`'s test cases through
     `cyberjection.orchestrator.execute_campaign`, scoped to the ones that
@@ -149,6 +187,7 @@ async def _execute_pipeline(
         db_url=db_url,
         resume_campaign_id=resume_campaign_id,
         max_concurrency=config.max_workers,
+        local_only=local_only,
     )
 
 
@@ -161,7 +200,7 @@ def _render_summary_table(findings: List[Finding], gate: QualityGateResult) -> T
 
     for finding in findings:
         status = "[red]FAIL[/red]" if finding.score >= gate.threshold else "[green]PASS[/green]"
-        table.add_row(finding.rule_id, finding.category, f"{finding.score:.1f}", status)
+        table.add_row(escape(finding.rule_id), escape(finding.category), f"{finding.score:.1f}", status)
 
     return table
 
@@ -197,6 +236,12 @@ def run_evaluation(
         help="Resume a previously interrupted campaign by its campaign id (see `cyberjection "
         "inspect`) instead of starting a new one",
     ),
+    local_only: bool = typer.Option(
+        False,
+        "--local-only",
+        help="Fast, zero-cost check for pre-commit hooks: the target must be a local endpoint, "
+        "only single-turn strategies run, and the remote LLM judge is disabled",
+    ),
 ) -> None:
     """Execute automated security evaluations against a specified target model."""
 
@@ -205,14 +250,14 @@ def run_evaluation(
     try:
         config = load_config(config_path)
     except ConfigValidationError as exc:
-        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
         _audit_logger.log("cli.run.config_error", resource=str(config_path), outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
     try:
         target = _resolve_target(config, target_id)
     except UnknownTargetError as exc:
-        console.print(f"[bold red]Target error:[/bold red] {exc}")
+        console.print(f"[bold red]Target error:[/bold red] {escape(str(exc))}")
         _audit_logger.log("cli.run.unknown_target", resource=target_id, outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
@@ -228,13 +273,49 @@ def run_evaluation(
     safe_json_out = _safe_output_path(json_out) if json_out else None
     safe_markdown_out = _safe_output_path(markdown_out) if markdown_out else None
 
+    if local_only:
+        from cyberjection.security.input_validation import is_local_endpoint
+
+        if not is_local_endpoint(target.provider.value, target.api_base):
+            console.print(
+                f"[bold red]--local-only refuses target {escape(target.id)}:[/bold red] its endpoint "
+                f"({escape(target.api_base or target.provider.value + ' default')}) is not on this machine "
+                "or a private network, so prompts would leave it. Point api_base at a local server "
+                "(Ollama, vLLM, LM Studio) or drop --local-only."
+            )
+            _audit_logger.log("cli.run.local_only_refused", resource=target.id, outcome="failure")
+            raise typer.Exit(code=EXIT_USAGE_ERROR)
+        try:
+            import litellm
+
+            litellm.telemetry = False  # nothing leaves the machine in this mode
+        except ImportError:  # pragma: no cover - litellm is a hard dependency
+            pass
+        console.print("[bold blue]Local-only mode:[/bold blue] single-turn strategies, no remote judge.")
+
+    if config.hubguard is not None and target.provider == ProviderType.HUGGINGFACE:
+        _enforce_hubguard_gate(config, target)
+
     effective_threshold = resolve_threshold(threshold, config.quality_gate.threshold)
+    budget_stop: Optional[BudgetExceededError] = None
     try:
         findings = asyncio.run(
-            _execute_pipeline(config, target, db_url=db_url, resume_campaign_id=resume_campaign_id)
+            _execute_pipeline(
+                config, target, db_url=db_url, resume_campaign_id=resume_campaign_id, local_only=local_only
+            )
+        )
+    except BudgetExceededError as exc:
+        budget_stop = exc
+        findings = list(exc.findings)
+        console.print(f"[bold yellow]Budget cap reached:[/bold yellow] {escape(str(exc))}")
+        _audit_logger.log(
+            "cli.run.budget_exceeded",
+            resource=target.id,
+            outcome="partial",
+            metadata={"spent_usd": exc.spent_usd, "cap_usd": exc.cap_usd},
         )
     except CampaignNotFoundError as exc:
-        console.print(f"[bold red]Cannot resume campaign:[/bold red] {exc}")
+        console.print(f"[bold red]Cannot resume campaign:[/bold red] {escape(str(exc))}")
         _audit_logger.log(
             "cli.run.resume_not_found", resource=resume_campaign_id or "<none>", outcome="failure"
         )
@@ -245,13 +326,13 @@ def run_evaluation(
 
     if safe_sarif_out:
         SARIFReporter.export(findings, safe_sarif_out, threshold=effective_threshold)
-        console.print(f"[bold green]SARIF report written to:[/bold green] {safe_sarif_out}")
+        console.print(f"[bold green]SARIF report written to:[/bold green] {escape(str(safe_sarif_out))}")
     if safe_json_out:
         JSONExporter.export(findings, safe_json_out, threshold=effective_threshold)
-        console.print(f"[bold green]JSON report written to:[/bold green] {safe_json_out}")
+        console.print(f"[bold green]JSON report written to:[/bold green] {escape(str(safe_json_out))}")
     if safe_markdown_out:
         MarkdownExporter.export(findings, safe_markdown_out, threshold=effective_threshold)
-        console.print(f"[bold green]Markdown report written to:[/bold green] {safe_markdown_out}")
+        console.print(f"[bold green]Markdown report written to:[/bold green] {escape(str(safe_markdown_out))}")
 
     _audit_logger.log(
         "cli.run.quality_gate",
@@ -266,6 +347,13 @@ def run_evaluation(
             f"meets or exceeds threshold {gate.threshold:.1f}"
         )
         raise typer.Exit(code=EXIT_QUALITY_GATE_FAILED)
+
+    if budget_stop is not None:
+        console.print(
+            "[bold yellow]INCOMPLETE:[/bold yellow] the campaign stopped at its budget cap; "
+            "raise max_cost_cap or narrow the campaign to evaluate every test."
+        )
+        raise typer.Exit(code=EXIT_BUDGET_EXCEEDED)
 
     console.print("[bold green]QUALITY GATE PASSED[/bold green]")
     raise typer.Exit(code=EXIT_OK)
@@ -346,7 +434,7 @@ def export_report(
     _audit_logger.log("cli.export.invoked", resource=str(from_json), metadata={"format": output_format})
 
     if not from_json.exists():
-        console.print(f"[bold red]Input file not found:[/bold red] {from_json}")
+        console.print(f"[bold red]Input file not found:[/bold red] {escape(str(from_json))}")
         _audit_logger.log("cli.export.input_missing", resource=str(from_json), outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
@@ -374,7 +462,7 @@ def export_report(
         _audit_logger.log("cli.export.unsupported_format", resource=output_format, outcome="failure")
         raise typer.Exit(code=EXIT_USAGE_ERROR)
 
-    console.print(f"[bold green]{output_format.upper()} report written to:[/bold green] {safe_output_path}")
+    console.print(f"[bold green]{output_format.upper()} report written to:[/bold green] {escape(str(safe_output_path))}")
     _audit_logger.log("cli.export.completed", resource=str(safe_output_path), outcome="success")
     raise typer.Exit(code=EXIT_OK)
 
@@ -407,6 +495,11 @@ def run_audit(
         "--fail-on-unavailable",
         help="Fail the dependency gate if pip-audit isn't installed (recommended for CI)",
     ),
+    verify_log: bool = typer.Option(
+        False,
+        "--verify-log",
+        help="Verify the audit log's hash chain (uses CYBERJECTION_AUDIT_KEY if set)",
+    ),
 ) -> None:
     """Run security-hardening checks: dependency vulnerabilities, hardcoded
     secrets, target URL safety, and/or the compliance control summary.
@@ -430,12 +523,29 @@ def run_audit(
         },
     )
 
-    if not any([check_deps, check_secrets, check_targets, show_compliance]):
+    if verify_log:
+        log_path = _audit_logger.log_path
+        result = verify_chain(log_path, key=audit_key_from_env())
+        if result.valid:
+            console.print(
+                f"[bold green]Audit log intact:[/bold green] {result.entries_checked} entries verified "
+                f"in {escape(str(log_path))}"
+            )
+        else:
+            console.print(
+                f"[bold red]Audit log verification FAILED[/bold red] at entry {result.first_broken_index}: "
+                f"{escape(str(result.reason))}"
+            )
+        overall_log_ok = result.valid
+    else:
+        overall_log_ok = True
+
+    if not any([check_deps, check_secrets, check_targets, show_compliance]) and not verify_log:
         check_deps = True
         check_secrets = True
 
     report_sections: List[str] = []
-    overall_ok = True
+    overall_ok = overall_log_ok
 
     if check_deps:
         console.print("[bold blue]Running dependency vulnerability audit...[/bold blue]")
@@ -443,13 +553,13 @@ def run_audit(
         gate_passed = evaluate_dependency_gate(dep_report, fail_on_unavailable=fail_on_unavailable)
         overall_ok = overall_ok and gate_passed
         if dep_report.source == "unavailable":
-            console.print(f"[yellow]Dependency audit unavailable:[/yellow] {dep_report.detail}")
+            console.print(f"[yellow]Dependency audit unavailable:[/yellow] {escape(str(dep_report.detail))}")
         elif dep_report.findings:
             console.print(f"[bold red]{len(dep_report.findings)} vulnerable dependencies found:[/bold red]")
             for finding in dep_report.findings:
                 console.print(
-                    f"  - {finding.package} {finding.installed_version}: "
-                    f"{finding.advisory_id} ({finding.summary})"
+                    f"  - {escape(str(finding.package))} {escape(str(finding.installed_version))}: "
+                    f"{escape(str(finding.advisory_id))} ({escape(str(finding.summary))})"
                 )
         else:
             console.print(
@@ -480,10 +590,10 @@ def run_audit(
         overall_ok = overall_ok and not findings
         if findings:
             console.print(f"[bold red]{len(findings)} potential secret(s) found:[/bold red]")
-            for finding in findings:
+            for secret in findings:
                 console.print(
-                    f"  - {finding.source}:{finding.line} [{finding.severity}] "
-                    f"{finding.pattern_name} -> {finding.excerpt}"
+                    f"  - {escape(str(secret.source))}:{escape(str(secret.line))} [{escape(str(secret.severity))}] "
+                    f"{escape(str(secret.pattern_name))} -> {escape(str(secret.excerpt))}"
                 )
         else:
             console.print("[bold green]No hardcoded secrets found.[/bold green]")
@@ -502,7 +612,7 @@ def run_audit(
         try:
             target_config = load_config(config_path)
         except ConfigValidationError as exc:
-            console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+            console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
             raise typer.Exit(code=EXIT_USAGE_ERROR)
         console.print("[bold blue]Checking target URLs...[/bold blue]")
         flagged: List[str] = []
@@ -520,7 +630,7 @@ def run_audit(
                 f"network targets are a normal dev configuration):[/yellow]"
             )
             for line in flagged:
-                console.print(f"  - {line}")
+                console.print(f"  - {escape(str(line))}")
         else:
             console.print("[bold green]No flagged target URLs.[/bold green]")
         _audit_logger.log(
@@ -539,7 +649,7 @@ def run_audit(
         safe_report_out.write_text(
             "# Cyberjection Security Audit Report\n\n" + "\n".join(report_sections), encoding="utf-8"
         )
-        console.print(f"[bold green]Audit report written to:[/bold green] {safe_report_out}")
+        console.print(f"[bold green]Audit report written to:[/bold green] {escape(str(safe_report_out))}")
 
     _audit_logger.log("cli.audit.completed", outcome="pass" if overall_ok else "fail")
 
@@ -564,7 +674,7 @@ def list_plugins() -> None:
 
     discovery = discover_plugins()
     for failure in discovery.failures:
-        console.print(f"[bold red]Plugin load failed:[/bold red] {failure}")
+        console.print(f"[bold red]Plugin load failed:[/bold red] {escape(str(failure))}")
 
     aliases_by_group = known_aliases_by_group()
     table = Table(title="Registered Plugins")
@@ -601,6 +711,20 @@ def serve_dashboard_api(
         help="Database URL the API reads campaign history from (defaults to the local SQLite "
         "results DB); ignored if SQLAlchemy/aiosqlite aren't installed",
     ),
+    dashboard_dir: Optional[Path] = typer.Option(
+        None,
+        "--dashboard-dir",
+        envvar="CYBERJECTION_DASHBOARD_DIR",
+        help="Also serve the built web dashboard (apps/dashboard/dist) from the same origin",
+    ),
+    api_token: Optional[str] = typer.Option(
+        None,
+        "--api-token",
+        envvar="CYBERJECTION_API_TOKEN",
+        help="Require 'Authorization: Bearer <token>' on /api/* (prefer the env var: "
+        "command-line arguments are visible to other local users)",
+        show_default=False,
+    ),
 ) -> None:
     """Serve the Phase 10 dashboard REST API (`cyberjection.api`) for
     `apps/dashboard` -- or any other HTTP client -- to consume.
@@ -612,15 +736,301 @@ def serve_dashboard_api(
     """
 
     from cyberjection.api.server import UvicornUnavailableError, run_server
+    from cyberjection.api.static import DashboardNotBuiltError
 
     _audit_logger.log("cli.serve.invoked", metadata={"host": host, "port": port})
     console.print(f"[bold blue]Cyberjection dashboard API[/bold blue] starting on {host}:{port}")
+    if dashboard_dir is not None:
+        console.print(f"[bold blue]Serving dashboard from[/bold blue] {escape(str(dashboard_dir))}")
+    if api_token:
+        console.print("[bold green]API authentication enabled[/bold green] (bearer token).")
+    elif host not in ("127.0.0.1", "::1", "localhost"):
+        console.print(
+            f"[bold yellow]WARNING:[/bold yellow] serving on {escape(host)} with no authentication. "
+            "Anyone who can reach this port can read campaign history. Set CYBERJECTION_API_TOKEN "
+            "or put an authenticating reverse proxy in front (see docs/DEPLOYMENT.md)."
+        )
     try:
-        run_server(host=host, port=port, db_url=db_url)
+        run_server(
+            host=host,
+            port=port,
+            db_url=db_url,
+            dashboard_dir=str(dashboard_dir) if dashboard_dir else None,
+            api_token=api_token,
+        )
+    except DashboardNotBuiltError as exc:
+        console.print(f"[bold red]Cannot serve dashboard:[/bold red] {escape(str(exc))}")
+        _audit_logger.log("cli.serve.dashboard_missing", outcome="failure")
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
     except UvicornUnavailableError as exc:
-        console.print(f"[bold red]Cannot start server:[/bold red] {exc}")
+        console.print(f"[bold red]Cannot start server:[/bold red] {escape(str(exc))}")
         _audit_logger.log("cli.serve.unavailable", outcome="failure")
         raise typer.Exit(code=EXIT_ENVIRONMENT_ERROR)
+
+
+# --- Phase 11: HubGuard ------------------------------------------------------------
+
+hubguard_app = typer.Typer(
+    name="hubguard",
+    help="Model supply-chain security: audit Hugging Face repositories before loading them.",
+    add_completion=False,
+)
+app.add_typer(hubguard_app, name="hubguard")
+
+_SEVERITY_STYLE = {"critical": "bold red", "high": "red", "medium": "yellow", "low": "cyan", "info": "dim"}
+_VERDICT_STYLE = {"PASS": "bold green", "WARN": "bold yellow", "BLOCK": "bold red"}
+
+
+def _render_hubguard_report(report: "HubGuardReport") -> None:
+    commit = f" @ {report.commit_sha[:12]}" if report.commit_sha else f" @ {report.revision}"
+    console.print(f"[bold blue]Repository:[/bold blue] {escape(str(report.repo_id))}{escape(str(commit))}")
+    verdict = report.verdict.value
+    style = _VERDICT_STYLE[verdict]
+    console.print(f"[bold]Safety Verdict:[/bold] [{style}]{verdict}[/{style}]")
+    console.print(f"[bold]Risk Score:[/bold] {report.risk_score}/10 (policy ceiling {report.max_allowed_risk_score})")
+    if report.incomplete:
+        console.print("[bold red]Scan incomplete:[/bold red] some files could not be verified (fail-closed).")
+    if not report.findings:
+        console.print("[bold green]No findings.[/bold green]")
+        return
+    table = Table(title=f"HubGuard Findings ({len(report.findings)})")  # count only: safe
+    table.add_column("Severity")
+    table.add_column("Category", style="magenta")
+    table.add_column("File", style="cyan")
+    table.add_column("Description")
+    for finding in report.findings:
+        sev = finding.severity.value
+        location = (finding.file or "-") + (f":{finding.line}" if finding.line else "")
+        table.add_row(
+            f"[{_SEVERITY_STYLE[sev]}]{sev.upper()}[/{_SEVERITY_STYLE[sev]}]",
+            finding.category.value,
+            escape(location),
+            escape(finding.description),
+        )
+    console.print(table)
+
+
+def _write_hubguard_outputs(
+    report: "HubGuardReport",
+    json_out: Optional[Path],
+    sarif_out: Optional[Path],
+    markdown_out: Optional[Path],
+) -> None:
+    findings = report.to_reporting_findings()
+    if json_out:
+        path = _safe_output_path(json_out)
+        path.write_text(report.to_json(), encoding="utf-8")
+        console.print(f"[bold green]HubGuard JSON report written to:[/bold green] {escape(str(path))}")
+    if sarif_out:
+        path = _safe_output_path(sarif_out)
+        SARIFReporter.export(findings, path, threshold=report.max_allowed_risk_score)
+        console.print(f"[bold green]SARIF report written to:[/bold green] {escape(str(path))}")
+    if markdown_out:
+        path = _safe_output_path(markdown_out)
+        MarkdownExporter.export(findings, path, threshold=report.max_allowed_risk_score)
+        console.print(f"[bold green]Markdown report written to:[/bold green] {escape(str(path))}")
+
+
+def _enforce_hubguard_gate(config: CampaignConfig, target: TargetConfig) -> None:
+    from cyberjection.hubguard.gate import gate_campaign
+
+    console.print(
+        f"[bold blue]HubGuard[/bold blue] auditing model repository for target [yellow]{target.id}[/yellow]..."
+    )
+    result = asyncio.run(gate_campaign(config, target_ids=[target.id], audit_logger=_audit_logger))
+    for report in result.reports.values():
+        _render_hubguard_report(report)
+    if result.blocked:
+        console.print("[bold red]SUPPLY-CHAIN GATE BLOCKED:[/bold red] the campaign was not started.")
+        _audit_logger.log("cli.run.hubguard_blocked", resource=target.id, outcome="fail")
+        raise typer.Exit(code=EXIT_SUPPLY_CHAIN_BLOCKED)
+
+
+def _exit_for_report(report: "HubGuardReport") -> None:
+    raise typer.Exit(code=EXIT_SUPPLY_CHAIN_BLOCKED if report.blocked else EXIT_OK)
+
+
+@hubguard_app.command("scan")
+def hubguard_scan(
+    repo_id: str = typer.Argument(..., help="Hugging Face repo id, e.g. meta-llama/Llama-3-8B-Instruct"),
+    revision: str = typer.Option("main", "--revision", "-r", help="Branch, tag or commit SHA to audit"),
+    policy: str = typer.Option("strict", "--policy", help="SafeTensors enforcement: strict | warn | off"),
+    block_remote_code: bool = typer.Option(False, "--block-remote-code", help="Block repos that need trust_remote_code"),
+    allow_org: Optional[List[str]] = typer.Option(None, "--allow-org", help="Allowed organization; repeatable"),
+    max_risk: float = typer.Option(7.0, "--max-risk", min=0.0, max=10.0, help="Risk score above which the verdict is BLOCK"),
+    no_pickles: bool = typer.Option(False, "--no-pickles", help="Skip pickle opcode scanning"),
+    no_remote_code: bool = typer.Option(False, "--no-remote-code", help="Skip remote code analysis"),
+    no_secrets: bool = typer.Option(False, "--no-secrets", help="Skip secret scanning"),
+    history_depth: int = typer.Option(10, "--history-depth", min=0, help="Earlier commits to scan for secrets"),
+    manifest: Optional[Path] = typer.Option(None, "--manifest", help="SHA-256 HashManifest (YAML/JSON) to verify against"),
+    verify_downloads: bool = typer.Option(False, "--verify-downloads", help="Stream weight files and verify their SHA-256"),
+    profile_remote_code: bool = typer.Option(
+        False, "--profile-remote-code", help="EXECUTES remote code in the restricted sandbox profiler (opt-in)"
+    ),
+    scan_weights: bool = typer.Option(False, "--scan-weights", help="Read tensors for anomaly statistics"),
+    local_dir: Optional[Path] = typer.Option(None, "--local-dir", help="Scan a local snapshot directory instead of the Hub"),
+    json_out: Optional[Path] = typer.Option(None, "--json-out", help="Write the full HubGuard JSON report"),
+    sarif_out: Optional[Path] = typer.Option(None, "--sarif-out", help="Write a SARIF 2.1.0 report"),
+    markdown_out: Optional[Path] = typer.Option(None, "--markdown-out", help="Write a Markdown report"),
+) -> None:
+    """Audit one model repository. Exits 0 (PASS/WARN), 4 (BLOCK), or 2 (usage error)."""
+
+    from cyberjection.hubguard import EnforcementLevel, HubGuardClient
+
+    _audit_logger.log("cli.hubguard.scan.invoked", resource=repo_id, metadata={"revision": revision})
+    # Validate output paths before doing any network work.
+    for out in (json_out, sarif_out, markdown_out):
+        if out:
+            _safe_output_path(out)
+    try:
+        client = HubGuardClient(
+            repo_id,
+            revision=revision,
+            safetensors_policy=EnforcementLevel(policy.lower()),
+            block_remote_code=block_remote_code,
+            allowed_organizations=allow_org or None,
+            max_allowed_risk_score=max_risk,
+            scan_pickles=not no_pickles,
+            scan_remote_code=not no_remote_code,
+            scan_secrets=not no_secrets,
+            history_depth=history_depth,
+            manifest=manifest,
+            verify_downloads=verify_downloads,
+            profile_remote_code=profile_remote_code,
+            scan_weights=scan_weights,
+            local_dir=local_dir,
+            audit_logger=_audit_logger,
+        )
+    except (ValueError, OSError, HubAccessError) as exc:
+        console.print(f"[bold red]Usage error:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
+    report = asyncio.run(client.audit_repository())
+    _render_hubguard_report(report)
+    _write_hubguard_outputs(report, json_out, sarif_out, markdown_out)
+    _exit_for_report(report)
+
+
+@hubguard_app.command("gate")
+def hubguard_gate(
+    config_path: Path = typer.Option(
+        Path("cyberjection.yaml"), "--config", "-c", help="Campaign config with a hubguard section"
+    ),
+    target_id: Optional[List[str]] = typer.Option(None, "--target", "-t", help="Limit to these target ids; repeatable"),
+) -> None:
+    """Audit every `huggingface` target in a campaign under its `hubguard:` policy."""
+
+    from cyberjection.hubguard.gate import gate_campaign
+
+    try:
+        config = load_config(config_path)
+    except ConfigValidationError as exc:
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
+    if config.hubguard is None:
+        console.print("[bold red]Configuration error:[/bold red] the campaign has no `hubguard:` section.")
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
+    result = asyncio.run(gate_campaign(config, target_ids=target_id or None, audit_logger=_audit_logger))
+    for target, report in result.reports.items():
+        console.rule(f"target: {escape(str(target))}")
+        _render_hubguard_report(report)
+    if result.skipped:
+        console.print(f"[dim]Skipped non-huggingface targets: {escape(str(', '.join(result.skipped)))}[/dim]")
+    if result.blocked:
+        console.print(f"[bold red]GATE BLOCKED:[/bold red] {escape(str(', '.join(result.blocked_targets)))}")
+        raise typer.Exit(code=EXIT_SUPPLY_CHAIN_BLOCKED)
+    console.print("[bold green]GATE PASSED[/bold green]")
+    raise typer.Exit(code=EXIT_OK)
+
+
+def _has_model_magic(path: Path) -> bool:
+    """Pickle (protocol 2+), ZIP (PyTorch/npz) or .npy content, whatever the
+    file is named -- so renaming a payload to `.txt` doesn't skip the scan."""
+
+    with path.open("rb") as handle:
+        head = handle.read(8)
+    return head[:1] == b"\x80" and head[1:2] in (b"\x02", b"\x03", b"\x04", b"\x05") or head.startswith(
+        (b"PK\x03\x04", b"\x93NUMPY")
+    )
+
+
+@hubguard_app.command("file")
+def hubguard_file(
+    paths: List[Path] = typer.Argument(..., help="Local .bin/.pt/.pkl/.npy/.safetensors/.py files to scan"),
+    max_risk: float = typer.Option(7.0, "--max-risk", min=0.0, max=10.0),
+) -> None:
+    """Statically scan local model files (never loads or executes them)."""
+
+    from datetime import datetime, timezone
+
+    from cyberjection.hubguard.models import HubGuardReport, ScannedFile
+    from cyberjection.hubguard.picklescan import is_pickle_candidate, scan_pickle_file
+    from cyberjection.hubguard.remotecode import analyze_python_source
+    from cyberjection.hubguard.safetensors import validate_safetensors_file
+
+    findings = []
+    scanned = []
+    for path in paths:
+        if not path.is_file():
+            console.print(f"[bold red]Not a file:[/bold red] {escape(str(path))}")
+            raise typer.Exit(code=EXIT_USAGE_ERROR)
+        suffix = path.suffix.lower()
+        if suffix == ".safetensors":
+            findings += validate_safetensors_file(path).findings
+            kind = "safetensors"
+        elif suffix == ".py":
+            source = path.read_text(encoding="utf-8", errors="replace")
+            findings += analyze_python_source(source, filename=path.name).findings
+            kind = "code"
+        elif is_pickle_candidate(str(path)) or _has_model_magic(path):
+            result = scan_pickle_file(path)
+            findings += result.findings
+            kind = result.format
+        else:
+            # Not a model format: nothing that loading could execute. Reported,
+            # not failed (fail-closed applies to formats we should understand).
+            console.print(f"[dim]Skipped {escape(str(path))}: not a recognized model file format.[/dim]")
+            kind = "skipped"
+        scanned.append(ScannedFile(path=str(path), size=path.stat().st_size, kind=kind))
+    report = HubGuardReport.build(
+        repo_id="local-files",
+        revision="local",
+        commit_sha=None,
+        findings=findings,
+        files=scanned,
+        max_allowed_risk_score=max_risk,
+        started_at=datetime.now(timezone.utc),
+        duration_seconds=0.0,
+    )
+    _render_hubguard_report(report)
+    _audit_logger.log("cli.hubguard.file", outcome=report.verdict.value.lower(), metadata={"files": len(paths)})
+    _exit_for_report(report)
+
+
+@hubguard_app.command("manifest")
+def hubguard_manifest(
+    repo_id: str = typer.Argument(..., help="Hugging Face repo id"),
+    output: Path = typer.Option(..., "--out", "-o", help="Where to write the manifest (.yaml or .json)"),
+    revision: str = typer.Option("main", "--revision", "-r"),
+    verify_downloads: bool = typer.Option(
+        False, "--verify-downloads", help="Hash the actual bytes instead of trusting Hub LFS metadata"
+    ),
+    local_dir: Optional[Path] = typer.Option(None, "--local-dir", help="Hash a local snapshot directory instead"),
+) -> None:
+    """Pin the SHA-256 of every weight and code file at a revision."""
+
+    from cyberjection.hubguard import HubGuardClient, generate_manifest
+
+    safe_output = _safe_output_path(output)
+    try:
+        client = HubGuardClient(repo_id, revision=revision, verify_downloads=verify_downloads, local_dir=local_dir)
+        manifest = asyncio.run(generate_manifest(client))
+    except (ValueError, OSError, HubAccessError) as exc:
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=EXIT_USAGE_ERROR)
+    manifest.dump(safe_output)
+    console.print(f"[bold green]Pinned {len(manifest.files)} file(s) to:[/bold green] {escape(str(safe_output))}")
+    _audit_logger.log("cli.hubguard.manifest", resource=repo_id, metadata={"files": len(manifest.files)})
+    raise typer.Exit(code=EXIT_OK)
 
 
 if __name__ == "__main__":

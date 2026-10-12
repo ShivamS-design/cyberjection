@@ -139,6 +139,47 @@ against OWASP ASVS 4.0 and the SOC 2 (2017) Trust Services Criteria. See
 [`docs/COMPLIANCE.md`](COMPLIANCE.md) for the full table and an
 explanation of why this is a self-assessment, not a certification.
 
+## Evaluation integrity and cost controls (0.12.0)
+
+- **Judge prompt-injection hardening.** The Tier 3 judge receives the attack
+  prompt and target response inside per-call random-nonce tags, with rules
+  stating that tagged content is untrusted data. A tripwire downgrades a
+  "not jailbroken" verdict to `UNCERTAIN` when the response contains
+  grader-manipulation markers, so a manipulated judge can't produce a silent
+  PASS.
+- **Enforced budget cap.** `max_cost_cap` is checked before every target,
+  attacker and judge call; overspend is bounded to calls already in flight.
+- **Concurrent persistence.** Repository access is serialized per campaign,
+  fixing a crash when concurrent test cases shared one database session.
+- **API.** Optional bearer-token auth; 500 responses carry an incident id,
+  never exception text.
+- **Audit log.** Optional HMAC-keyed chain with downgrade detection.
+
+## Model supply-chain controls (Phase 11)
+
+Phase 11 adds controls that protect the *operator's* environment from
+third-party model artifacts -- the first controls in this project aimed
+at content Cyberjection downloads rather than at its own operation.
+
+- **No deserialization during scanning.** Pickle files are decoded
+  opcode-by-opcode with `pickletools.genops`; nothing calls
+  `pickle.load`/`torch.load`. A regression test asserts a payload that
+  would create a file on load leaves no file behind after every scan
+  path.
+- **Fail-closed verdicts.** Unreadable or unparseable files, and pickle
+  imports that can't be statically resolved, are findings, never skips.
+- **Pinned reads.** Every file read is pinned to the commit SHA the
+  revision resolved to at the start of the scan.
+- **Token scoping.** `HF_TOKEN` is attached with
+  `add_unredirected_header` and re-attached only on same-host
+  redirects; requests to CDN hosts never carry it. The sandbox runs with
+  an empty environment, so the token never reaches profiled code either.
+- **Bounded resource use.** Header-size, pickle-stream, ZIP-member,
+  compression-ratio, text-file and history-byte ceilings keep a hostile
+  repository from turning the scanner into a denial of service.
+- **Redaction.** Secret findings carry only a 4-character prefix and
+  length.
+
 ## Known limitations
 
 - The SSRF guard is literal-value only; it does not resolve or pin DNS,
@@ -158,5 +199,23 @@ explanation of why this is a self-assessment, not a certification.
   pattern. It is a defense-in-depth check, not a substitute for a
   dedicated secret-scanning service or pre-commit hook in front of your
   own fork's CI.
+- The judge tripwire is pattern-based: it catches common grader-manipulation
+  phrasing, not every possible one. It reduces silent PASSes; it doesn't make
+  an LLM judge adversarially robust. Keep Tier 1 patterns for known secrets.
+- `max_cost_cap` only covers calls whose cost is known; the CLI reports
+  unpriced calls. Add a `pricing` block for custom models.
+- HubGuard's static analyzers can be evaded by code they can't resolve;
+  those cases are reported (fail closed) but the report can't say what
+  the code would have done. The opt-in sandbox profiler uses PEP 578
+  audit hooks, which PEP 578 itself says are not a security boundary,
+  plus rlimits and a network namespace on Linux; it applies no seccomp
+  filter. Run it inside a disposable container/VM for production use.
+- HubGuard's backdoor trigger probe can only find triggers in its
+  candidate list (defaults plus statically nominated embedding
+  outliers); a clean probe is not proof that no trigger exists, and
+  weight statistics are sampled for large tensors.
+- Hub repositories are not signed. Integrity checks verify against the
+  Hub's own hash metadata and operator-pinned manifests, not publisher
+  signatures.
 - None of this phase's controls apply to a target's own infrastructure --
   they protect *this tool's* operation, not the system under test.

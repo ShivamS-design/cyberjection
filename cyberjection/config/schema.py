@@ -26,6 +26,7 @@ class ProviderType(str, Enum):
     GEMINI = "gemini"
     VLLM = "vllm"
     CUSTOM_HTTP = "custom_http"
+    HUGGINGFACE = "huggingface"
 
 
 class AssertionType(str, Enum):
@@ -35,6 +36,15 @@ class AssertionType(str, Enum):
     CONTAINS_ANY = "contains-any"
     REGEX = "regex"
     LLM_JUDGE = "llm-judge"
+
+
+class PricingConfig(BaseModel):
+    """Explicit per-token pricing for a target LiteLLM can't price itself
+    (self-hosted, fine-tuned or custom endpoints). Used by
+    `cyberjection.budget` to enforce `max_cost_cap`."""
+
+    input_per_million_usd: float = Field(..., ge=0.0, description="USD per 1M prompt tokens.")
+    output_per_million_usd: float = Field(..., ge=0.0, description="USD per 1M completion tokens.")
 
 
 class RateLimitConfig(BaseModel):
@@ -66,6 +76,33 @@ class QualityGateConfig(BaseModel):
     )
 
 
+class HubGuardConfig(BaseModel):
+    """Phase 11 model supply-chain gate, applied to every `huggingface`
+    target before a campaign sends it a single prompt (see
+    `cyberjection.hubguard.gate`). Declaring the section turns the gate on;
+    omitting it leaves campaigns exactly as they behaved before Phase 11."""
+
+    enforce_safetensors: bool = Field(
+        default=True, description="STRICT SafeTensors-only policy; False downgrades pickle weights to warnings."
+    )
+    block_remote_code: bool = Field(
+        default=True, description="Reject repositories (and targets) that need trust_remote_code=True."
+    )
+    max_allowed_risk_score: float = Field(default=7.0, ge=0.0, le=10.0)
+    allowed_organizations: List[str] = Field(
+        default_factory=list, description="Hub organizations targets may come from; empty allows any."
+    )
+    scan_pickles: bool = True
+    scan_remote_code: bool = True
+    scan_secrets: bool = True
+    history_depth: int = Field(default=10, ge=0, le=200)
+    manifest: Optional[str] = Field(default=None, description="Path to a SHA-256 HashManifest (YAML/JSON).")
+    verify_downloads: bool = False
+    profile_remote_code: bool = Field(
+        default=False, description="Opt-in: execute remote code in the restricted sandbox profiler."
+    )
+
+
 class TargetConfig(BaseModel):
     """A single system-under-test endpoint (model, agent, or RAG pipeline)."""
 
@@ -78,7 +115,16 @@ class TargetConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=1)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    pricing: Optional[PricingConfig] = Field(
+        default=None, description="Override LiteLLM's pricing data for budget enforcement."
+    )
     custom_headers: Dict[str, str] = Field(default_factory=dict)
+    trust_remote_code: bool = Field(
+        default=False, description="Whether this (Hugging Face) target is loaded with trust_remote_code=True."
+    )
+    revision: Optional[str] = Field(
+        default=None, description="Hub revision (branch, tag or commit SHA) HubGuard audits; defaults to 'main'."
+    )
 
 
 class StrategyConfig(BaseModel):
@@ -136,9 +182,44 @@ class CampaignConfig(BaseModel):
     targets: List[TargetConfig]
     strategies: List[StrategyConfig] = Field(default_factory=list)
     tests: List[TestCaseConfig] = Field(default_factory=list)
-    max_cost_cap: float = Field(default=10.0, ge=0.0)
+    max_cost_cap: float = Field(
+        default=10.0,
+        ge=0.0,
+        description="USD cap on measured model spend (target, attacker and judge calls); 0 disables it.",
+    )
     max_workers: int = Field(default=50, ge=1, le=200)
     quality_gate: QualityGateConfig = Field(default_factory=QualityGateConfig)
+    hubguard: Optional[HubGuardConfig] = None
+
+    @model_validator(mode="after")
+    def validate_hubguard_policy(self) -> "CampaignConfig":
+        """Fails fast at load time on policy violations that need no network
+        access: remote code a policy forbids, or an organization outside the
+        allowlist. Repository-content checks happen in the gate itself."""
+
+        if self.hubguard is None:
+            return self
+        allowed = {o.lower() for o in self.hubguard.allowed_organizations}
+        for target in self.targets:
+            if self.hubguard.block_remote_code and target.trust_remote_code:
+                raise ValueError(
+                    f"Target '{target.id}' sets trust_remote_code: true but hubguard.block_remote_code is enabled."
+                )
+            if target.provider != ProviderType.HUGGINGFACE:
+                continue
+            from cyberjection.hubguard.transport import repo_id_from_model
+
+            try:
+                repo_id = repo_id_from_model(target.model)
+            except ValueError as exc:
+                raise ValueError(f"Target '{target.id}': {exc}") from None
+            org = repo_id.split("/")[0].lower() if "/" in repo_id else ""
+            if allowed and org not in allowed:
+                raise ValueError(
+                    f"Target '{target.id}' model '{repo_id}' is from organization '{org or '(none)'}', "
+                    f"which is not in hubguard.allowed_organizations {sorted(allowed)}."
+                )
+        return self
 
     @model_validator(mode="after")
     def validate_unique_target_ids(self) -> "CampaignConfig":

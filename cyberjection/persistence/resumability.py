@@ -23,7 +23,7 @@ repository` or its `sqlalchemy` dependency. Only actually constructing a
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from pydantic import BaseModel
 
@@ -102,7 +102,7 @@ def _compute_next_turn_number(turns: List[ResumedTurnState]) -> int:
     return candidate
 
 
-def reconcile_test_state(test) -> ResumedTestState:
+def reconcile_test_state(test: Any) -> ResumedTestState:
     """Builds a `ResumedTestState` from one persisted test-like object.
 
     `test` needs only duck-typed attributes: `.id`, `.target_id`,
@@ -138,7 +138,7 @@ def reconcile_test_state(test) -> ResumedTestState:
     )
 
 
-def build_resume_map(tests) -> Dict[Tuple[str, str, str], ResumedTestState]:
+def build_resume_map(tests: Iterable[Any]) -> Dict[Tuple[str, str, str], ResumedTestState]:
     """Reconciles every persisted test in a campaign into a lookup keyed by
     the natural (target_id, strategy, seed_prompt) key a campaign config's
     `TestCaseConfig` entries carry -- so the orchestrator can look up

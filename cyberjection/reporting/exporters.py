@@ -14,13 +14,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from cyberjection.reporting.models import Finding
 from cyberjection.reporting.registry import register_exporter
 
 
-def _summary(findings: List[Finding], threshold: float) -> dict:
+def _summary(findings: List[Finding], threshold: float) -> Dict[str, Any]:
     failing = [f for f in findings if f.score >= threshold]
     max_score = max((f.score for f in findings), default=0.0)
     return {

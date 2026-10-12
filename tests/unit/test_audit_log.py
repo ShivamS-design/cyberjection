@@ -11,7 +11,6 @@ import json
 import threading
 from pathlib import Path
 
-import pytest
 
 from cyberjection.security.audit_log import GENESIS_HASH, AuditLogger, verify_chain
 

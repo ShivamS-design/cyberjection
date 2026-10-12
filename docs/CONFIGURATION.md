@@ -37,16 +37,17 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `targets` | list of `TargetConfig` | required | Must have unique `id`s. |
 | `strategies` | list of `StrategyConfig` | `[]` | Must have unique `id`s. |
 | `tests` | list of `TestCaseConfig` | `[]` | Each `target` and `strategy` reference must match a known id. |
-| `max_cost_cap` | float | `10.0` | Hard budget ceiling in USD; must be `>= 0`. |
+| `max_cost_cap` | float | `10.0` | USD cap on measured model spend: target, attacker and judge calls. Checked before every call; `0` disables it. When reached, running tests stop, unstarted tests are reported as `budget_exceeded`, the campaign is stored as `BUDGET_EXCEEDED`, and `cyberjection run` exits `5` after writing its reports. Calls whose cost can't be determined (models missing from LiteLLM's pricing data, with no `pricing` block) are counted and reported, never charged an invented amount. |
 | `max_workers` | int | `50` | Concurrent worker cap; `1-200`. |
 | `quality_gate` | `QualityGateConfig` | see below | CI/CD pass/fail threshold (Phase 6). |
+| `hubguard` | `HubGuardConfig` | optional | Model supply-chain gate for `huggingface` targets (Phase 11); see below. |
 
 ## `TargetConfig`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `id` | string | required | Unique key referenced by test cases. |
-| `provider` | enum | required | One of `openai`, `anthropic`, `ollama`, `bedrock`, `azure`, `gemini`, `vllm`, `custom_http`. |
+| `provider` | enum | required | One of `openai`, `anthropic`, `ollama`, `bedrock`, `azure`, `gemini`, `vllm`, `custom_http`, `huggingface`. |
 | `model` | string | required | Provider-specific model name, e.g. `gpt-4o-mini`. |
 | `api_key` | secret string | optional | Wrapped in `SecretStr`; never printed in reprs or logs. |
 | `api_base` | string | optional | Custom endpoint base URL. |
@@ -55,6 +56,9 @@ contains `${INNER}`, that is left as literal text, not expanded again.
 | `max_tokens` | int | `1024` | Must be `>= 1`. |
 | `rate_limit` | `RateLimitConfig` | see below | Per-target throughput controls. |
 | `custom_headers` | dict[str, str] | `{}` | Extra HTTP headers for custom endpoints. |
+| `pricing` | object | optional | `{input_per_million_usd, output_per_million_usd}`: explicit token pricing for self-hosted or custom models, used by `max_cost_cap`. Overrides LiteLLM's pricing data. |
+| `trust_remote_code` | bool | `false` | Declares that this Hugging Face target is loaded with `trust_remote_code=True`; rejected when `hubguard.block_remote_code` is on. |
+| `revision` | string | optional | Hub branch, tag or commit SHA that HubGuard audits (default `main`). Pin a commit SHA in production. |
 
 ## `RateLimitConfig`
 
@@ -343,10 +347,12 @@ await coordinator.broadcast_if_failing(test_case_id, verdict)
 
 Running the distributed components against a real cluster requires the
 `redis` and `celery` packages (both hard dependencies -- see
-`pyproject.toml`) and a reachable Redis instance:
+`pyproject.toml`) and a reachable Redis server (installed from your
+platform's package manager, e.g. `apt install redis-server`, or a managed
+Redis service):
 
 ```bash
-docker run -d --name cyberjection-redis -p 6379:6379 redis:alpine
+redis-server --port 6379 &
 celery -A cyberjection.distributed.celery_app worker --loglevel=info
 ```
 
@@ -447,8 +453,89 @@ cyberjection serve --host 0.0.0.0 --port 8000 --db-url sqlite+aiosqlite:///.cybe
 `apps/dashboard/` is a Vite + React + TypeScript single-page app
 consuming this API (campaigns list, campaign detail, test transcript
 view, plugins page). See [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for how to
-build and run it, either directly (`npm run dev`/`npm run build`) or via
-the provided Docker images.
+build it and serve it alongside the API with
+`cyberjection serve --dashboard-dir apps/dashboard/dist`.
+
+## Local-only checks and developer workflow (0.12.0)
+
+`cyberjection run --local-only` is a fast, zero-cost check meant for
+pre-commit hooks. The target must be a local endpoint (Ollama on its
+default port, or an `api_base` on a loopback/private address); any other
+target is refused before a prompt is sent. Only single-turn strategies run
+(multi-turn tests are reported as `skipped_local_only`), and the remote LLM
+judge is disabled, so inconclusive results stay `UNCERTAIN`.
+
+Integrations shipped in the repository:
+
+| File | Use |
+|---|---|
+| `.pre-commit-hooks.yaml` | `cyberjection-local` (prompt-safety check) and `cyberjection-hubguard` (scans staged model files) for [pre-commit](https://pre-commit.com). |
+| `action.yml` | GitHub Action: `uses: ShivamS-design/cyberjection@v0.12.0` with `command: run | hubguard-gate | hubguard-scan | audit`; uploads SARIF to code scanning. |
+| `ci/gitlab/cyberjection.gitlab-ci.yml` | GitLab CI templates (`.cyberjection-run`, `.cyberjection-hubguard`) to `include:` and `extends:`. |
+| `examples/ci/scheduled-compliance.yml` | Weekly scheduled red-team run producing an OWASP report. |
+
+The OWASP Top 10 for LLM Applications (2025) coverage report is an
+exporter: `cyberjection export --from-json results.json --format owasp-llm
+--output owasp.md`. Map tests to categories with `owasp_category`; 2023
+identifiers and keywords are accepted, and untested categories are listed
+as `NOT TESTED`.
+
+Exit codes for `cyberjection run`: `0` pass, `1` quality gate failed, `2`
+usage/config error, `3` missing runtime dependency, `4` HubGuard blocked
+the target, `5` budget cap reached (reports still written).
+
+## HubGuard model supply-chain gate (Phase 11)
+
+Declaring a top-level `hubguard:` section turns the gate on. Every target
+with `provider: huggingface` is audited by `cyberjection run` (and by
+`cyberjection hubguard gate`) before any prompt is sent; a `BLOCK`
+verdict stops the run with exit code `4`. Campaigns without the section
+behave exactly as before Phase 11.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enforce_safetensors` | bool | `true` | `true` = STRICT SafeTensors-only (pickle weights and a missing `.safetensors` are blocking); `false` = WARN. |
+| `block_remote_code` | bool | `true` | Repositories whose `auto_map` needs `trust_remote_code` are blocked, and a target with `trust_remote_code: true` fails at config load. |
+| `max_allowed_risk_score` | float | `7.0` | `0.0-10.0`. Scores above this are `BLOCK`. |
+| `allowed_organizations` | list[str] | `[]` | Case-insensitive Hub org allowlist; empty allows any. Checked at config load *and* at audit time. |
+| `scan_pickles` / `scan_remote_code` / `scan_secrets` | bool | `true` | Toggle individual scanners. |
+| `history_depth` | int | `10` | `0-200`. Earlier commits whose text files and messages are scanned for secrets. |
+| `manifest` | string | optional | Path to a `HashManifest` (YAML/JSON) of pinned SHA-256s; see `cyberjection hubguard manifest`. |
+| `verify_downloads` | bool | `false` | Stream every weight file and verify its real SHA-256 (downloads the weights). |
+| `profile_remote_code` | bool | `false` | **Executes** the repository's Python in the restricted sandbox profiler. |
+
+```yaml
+hubguard:
+  enforce_safetensors: true
+  block_remote_code: true
+  max_allowed_risk_score: 2.0
+  allowed_organizations: ["meta-llama"]
+targets:
+  - id: "production-candidate"
+    provider: "huggingface"
+    model: "huggingface/meta-llama/Llama-3-8B-Instruct"   # "huggingface/" prefix optional
+    trust_remote_code: false
+    revision: "main"
+```
+
+The Hub token is read from `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) and
+is only sent to the Hub endpoint (`HF_ENDPOINT`, default
+`https://huggingface.co`), never to the CDN hosts that file downloads
+redirect to. A `HashManifest` looks like:
+
+```yaml
+repo_id: meta-llama/Llama-3-8B-Instruct
+revision: <commit sha>        # optional; a different scanned commit is a MEDIUM finding
+files:
+  model-00001-of-00004.safetensors: <sha256 hex>
+```
+
+CLI equivalents: `cyberjection hubguard scan <repo>` (one repository,
+flags mirror the fields above plus `--local-dir`, `--scan-weights`,
+`--json-out`/`--sarif-out`/`--markdown-out`), `hubguard gate -c
+<campaign>`, `hubguard manifest <repo> --out pins.yaml`, and `hubguard
+file <paths...>` for local files. All exit `0` for PASS/WARN, `4` for
+BLOCK, `2` for usage errors.
 
 ## Full example
 

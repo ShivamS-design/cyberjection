@@ -60,16 +60,20 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         framework=ASVS,
         title="Authentication controls",
         status=ControlStatus.PARTIAL,
-        evidence=("cyberjection/api/", "docker-compose.yml", "docs/DEPLOYMENT.md"),
+        evidence=(
+            "cyberjection/api/asgi.py:ASGIApp._authorized",
+            "cyberjection/cli/main.py (serve --api-token / CYBERJECTION_API_TOKEN)",
+            "tests/unit/test_hardening_batch.py::TestApiAuth",
+            "docs/DEPLOYMENT.md",
+        ),
         notes=(
-            "Phase 10's dashboard API (cyberjection.api) introduced Cyberjection's first "
-            "network-facing surface, and it deliberately implements no authentication of its "
-            "own -- the 'single trusted team, one instance' deployment model documented in "
-            "docs/DEPLOYMENT.md puts the operator's own network perimeter/reverse proxy in "
-            "front of it instead of building a second, likely-worse auth layer inside this "
-            "project. Every endpoint is also read-only (see docs/ARCHITECTURE.md's Phase 10 "
-            "section), so the surface an unauthenticated caller can reach is bounded to "
-            "already-completed campaign history, not campaign execution."
+            "Since 0.12.0 the dashboard API supports an optional shared bearer token "
+            "(constant-time comparison; /api/health exempt), and `serve` warns when bound "
+            "beyond loopback without it. PARTIAL because there are no per-user identities, "
+            "roles or SSO: the 'single trusted team, one instance' model in docs/DEPLOYMENT.md "
+            "still expects an authenticating reverse proxy for anything wider. Every endpoint "
+            "is read-only, so the reachable surface is completed campaign history, not campaign "
+            "execution."
         ),
     ),
     ControlMapping(
@@ -116,15 +120,19 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         framework=ASVS,
         title="Log records are protected against unauthorized modification",
         status=ControlStatus.PARTIAL,
-        evidence=("cyberjection/security/audit_log.py:verify_chain",),
+        evidence=(
+            "cyberjection/security/audit_log.py:verify_chain",
+            "cyberjection/security/audit_log.py (HMAC chain via CYBERJECTION_AUDIT_KEY)",
+            "cyberjection audit --verify-log",
+        ),
         notes=(
-            "Hash-chained log entries make tampering with an existing entry "
-            "detectable via verify_chain(), but the log file itself has no "
-            "filesystem-level write protection or off-host replication -- an "
-            "attacker with delete access can still truncate and restart the "
-            "chain. Full protection needs an append-only or remote log sink, "
-            "which is deployment-environment-specific and out of this "
-            "library's scope."
+            "With CYBERJECTION_AUDIT_KEY set, entries form an HMAC-SHA256 chain that "
+            "can't be rewritten without the key, and a keyed verifier rejects downgraded "
+            "(unkeyed) entries; `cyberjection audit --verify-log` checks it. The file "
+            "itself still has no write protection or off-host replication -- an "
+            "attacker with delete access can truncate it. Full protection needs an "
+            "append-only or remote log sink, which is deployment-environment-specific "
+            "and out of this library's scope."
         ),
     ),
     ControlMapping(
@@ -134,6 +142,47 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         status=ControlStatus.PARTIAL,
         evidence=("cyberjection/providers/litellm_provider.py (delegates HTTPS handling to litellm/httpx)",),
         notes="Relies on litellm's own default HTTPS behavior; not independently verified or pinned by this codebase.",
+    ),
+    ControlMapping(
+        control_id="ASVS-V10.2",
+        framework=ASVS,
+        title="Malicious code search: third-party code and artifacts are checked for malicious behavior",
+        status=ControlStatus.PARTIAL,
+        evidence=(
+            "cyberjection/hubguard/picklescan.py",
+            "cyberjection/hubguard/remotecode.py",
+            "cyberjection/hubguard/sandbox.py",
+            "tests/unit/test_hubguard_picklescan.py",
+            "tests/unit/test_hubguard_remotecode.py",
+            "tests/unit/test_hubguard_sandbox.py",
+        ),
+        notes=(
+            "Phase 11 HubGuard statically scans third-party model artifacts (pickle checkpoints, "
+            "trust_remote_code Python) before load and can behaviorally profile remote code in a "
+            "restricted child interpreter. PARTIAL because static analysis can be evaded by code it "
+            "cannot resolve (reported as findings, fail-closed) and the sandbox uses audit hooks, "
+            "rlimits and a network namespace but no seccomp filter -- see the sandbox module docstring. "
+            "Covers model artifacts, not this project's own Python dependencies (see ASVS-V14.2)."
+        ),
+    ),
+    ControlMapping(
+        control_id="ASVS-V10.3",
+        framework=ASVS,
+        title="Deployed components' integrity is verified (signatures/hashes) before use",
+        status=ControlStatus.IMPLEMENTED,
+        evidence=(
+            "cyberjection/hubguard/safetensors.py:HashManifest",
+            "cyberjection/hubguard/safetensors.py:compare_against_manifest",
+            "cyberjection/hubguard/client.py (git blob SHA-1 + --verify-downloads SHA-256)",
+            "cyberjection/hubguard/gate.py (cyberjection run refuses BLOCKed huggingface targets)",
+            "tests/unit/test_hubguard_client.py",
+        ),
+        notes=(
+            "Model weights and code are pinned by SHA-256 manifests, every fetched file is checked "
+            "against the Hub's Git blob id, and all reads are pinned to the resolved commit SHA. "
+            "Hub repositories are not cryptographically signed, so verification is against "
+            "operator-pinned hashes, not publisher signatures."
+        ),
     ),
     ControlMapping(
         control_id="ASVS-V12.1",
@@ -202,8 +251,16 @@ CONTROL_REGISTRY: List[ControlMapping] = [
         framework=SOC2,
         title="Unauthorized or malicious changes to software are prevented or detected",
         status=ControlStatus.PARTIAL,
-        evidence=("cyberjection/security/secrets_audit.py", ".github/workflows/cyberjection.yml (CI runs on every push/PR)"),
-        notes="Secret and dependency scanning run in CI; there is no code-signing or branch-protection enforcement configurable from within this repository's own tooling.",
+        evidence=(
+            "cyberjection/security/secrets_audit.py",
+            ".github/workflows/cyberjection.yml (CI runs on every push/PR)",
+            "cyberjection/hubguard/ (model supply-chain gate, Phase 11)",
+        ),
+        notes=(
+            "Secret and dependency scanning run in CI, and Phase 11's HubGuard gate blocks tampered or "
+            "malicious third-party model artifacts before they are loaded; there is no code-signing or "
+            "branch-protection enforcement configurable from within this repository's own tooling."
+        ),
     ),
     ControlMapping(
         control_id="SOC2-CC7.2",

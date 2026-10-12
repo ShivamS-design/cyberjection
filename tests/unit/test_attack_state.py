@@ -9,7 +9,6 @@ import pytest
 from cyberjection.attacks.state import (
     AttackNode,
     ConversationContext,
-    TurnStatus,
     score_from_evaluation,
 )
 from cyberjection.evaluators.base import EvaluationOutcome, Verdict

@@ -1,3 +1,7 @@
 node_modules/
 dist/
 *.local
+# tsc -b build outputs (see package.json "build")
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

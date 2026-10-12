@@ -59,7 +59,7 @@ class AhoCorasick:
             node.output.append(pattern)
 
     def _build_fail_links(self) -> None:
-        queue: deque = deque()
+        queue: "deque[_Node]" = deque()
         for child in self._root.children.values():
             child.fail = self._root
             queue.append(child)

@@ -24,7 +24,7 @@ works in `cyberjection.orchestrator.campaign._build_cascade_evaluator`.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Type
+from typing import Any, Callable, Dict, List, Type, TypeVar
 
 from cyberjection.evaluators.base import BaseEvaluator
 
@@ -34,15 +34,16 @@ class EvaluatorRegistrationError(Exception):
 
 
 _REGISTRY: Dict[str, Type[BaseEvaluator]] = {}
+_T = TypeVar("_T", bound=Type[BaseEvaluator])
 
 
-def register_evaluator(alias: str):
+def register_evaluator(alias: str) -> Callable[[_T], _T]:
     """Class decorator registering a :class:`BaseEvaluator` subclass under
     ``alias``. Re-registering the same class under the same alias is
     idempotent; registering a *different* class under an alias already in
     use raises :class:`EvaluatorRegistrationError`."""
 
-    def decorator(cls: Type[BaseEvaluator]) -> Type[BaseEvaluator]:
+    def decorator(cls: _T) -> _T:
         if not (isinstance(cls, type) and issubclass(cls, BaseEvaluator)):
             raise EvaluatorRegistrationError(
                 f"Cannot register '{alias}': {cls!r} is not a BaseEvaluator subclass."

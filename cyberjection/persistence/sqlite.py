@@ -11,7 +11,7 @@ actually cascade).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
@@ -58,7 +58,7 @@ def _register_sqlite_pragmas(engine: AsyncEngine) -> None:
     """
 
     @event.listens_for(engine.sync_engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:  # noqa: ANN001
+    def _set_sqlite_pragma(dbapi_connection: Any, connection_record: Any) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON;")
         cursor.execute("PRAGMA synchronous=NORMAL;")

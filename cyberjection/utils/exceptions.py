@@ -8,7 +8,7 @@ than every underlying HTTP/YAML/Pydantic library's native error types.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, List, Optional
 
 
 class CyberjectionException(Exception):
@@ -41,7 +41,26 @@ class ProviderRateLimitError(ProviderError):
 
 
 class BudgetExceededError(CyberjectionException):
-    """Raised when a campaign's cumulative spend exceeds --max-cost."""
+    """Raised when a campaign's measured spend reaches `max_cost_cap`.
+
+    Raised by `cyberjection.budget` before a model call that would exceed
+    the cap, and again by `execute_campaign` once the run has wound down,
+    carrying the findings of the tests that did complete so the CLI can
+    still write its reports."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        target_id: Optional[str] = None,
+        spent_usd: float = 0.0,
+        cap_usd: Optional[float] = None,
+        findings: Optional[List[Any]] = None,
+    ) -> None:
+        super().__init__(message, target_id=target_id)
+        self.spent_usd = spent_usd
+        self.cap_usd = cap_usd
+        self.findings = findings or []
 
 
 class AttackerGenerationError(CyberjectionException):

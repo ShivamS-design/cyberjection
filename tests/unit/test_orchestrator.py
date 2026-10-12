@@ -142,8 +142,17 @@ class _FakeRepository:
     async def update_test_outcome(self, test_row_id: str, verdict: str, score: float, status: str = "COMPLETED") -> None:
         self.outcome_updates.append((test_row_id, verdict, score, status))
 
-    async def upsert_metrics(self, test_row_id: str, *, prompt_tokens: Optional[int] = None, completion_tokens: Optional[int] = None) -> None:
+    async def upsert_metrics(
+        self,
+        test_row_id: str,
+        *,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        total_cost: Optional[float] = None,
+    ) -> None:
+        # Mirrors CampaignRepository.upsert_metrics' real signature.
         self.metric_updates.append((test_row_id, prompt_tokens, completion_tokens))
+        self.cost_updates = getattr(self, "cost_updates", []) + [(test_row_id, total_cost)]
 
 
 class _FakeResumabilityManager:
@@ -756,9 +765,9 @@ class TestExecuteCampaign:
         captured: Dict[str, Any] = {}
 
         class _CapturingOrchestrator(campaign_mod.CampaignOrchestrator):
-            def __init__(self, *, repository=None, resumability=None, max_concurrency=10) -> None:
+            def __init__(self, *, repository=None, resumability=None, max_concurrency=10, **kwargs) -> None:
                 captured["max_concurrency"] = max_concurrency
-                super().__init__(repository=repository, resumability=resumability, max_concurrency=max_concurrency)
+                super().__init__(repository=repository, resumability=resumability, max_concurrency=max_concurrency, **kwargs)
 
         monkeypatch.setattr(campaign_mod, "CampaignOrchestrator", _CapturingOrchestrator)
 

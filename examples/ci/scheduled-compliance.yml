@@ -1,0 +1,39 @@
+# Example: weekly multi-turn stress test + OWASP LLM Top 10 report.
+# Copy to .github/workflows/ in the repository that owns your campaign.
+# Uses real (paid) model calls: keep max_cost_cap set in the campaign YAML.
+name: Weekly AI red-team compliance run
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  red-team:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "cyberjection==0.12.0"
+      - name: Run campaign (one paid run) and build reports from its JSON
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set +e
+          cyberjection run --config redteam/compliance-campaign.yaml --target production-assistant             --json-out results.json --sarif-out results.sarif
+          code=$?
+          cyberjection export --from-json results.json --format owasp-llm --output owasp-llm-top10.md
+          exit $code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: compliance-reports
+          path: |
+            owasp-llm-top10.md
+            results.json

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from cyberjection.reporting.models import Finding
 from cyberjection.reporting.registry import register_exporter
@@ -53,8 +53,8 @@ class SARIFReporter:
     @staticmethod
     def export(findings: List[Finding], output_path: Path, *, threshold: float = 7.0) -> None:
         rule_index_by_id: Dict[str, int] = {}
-        rules: List[dict] = []
-        sarif_results: List[dict] = []
+        rules: List[Dict[str, Any]] = []
+        sarif_results: List[Dict[str, Any]] = []
 
         for finding in findings:
             if finding.rule_id not in rule_index_by_id:
