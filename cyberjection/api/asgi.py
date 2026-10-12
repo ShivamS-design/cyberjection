@@ -25,11 +25,16 @@ for.
 
 from __future__ import annotations
 
+import hmac
 import json
+import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl
+
+logger = logging.getLogger("cyberjection.api")
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
 
@@ -134,8 +139,12 @@ class ASGIApp:
     this app has no startup/shutdown work to do) and `http` (routing
     through `self.router`, JSON error responses for a 404/405/500)."""
 
-    def __init__(self, router: Router, *, static: Optional[Any] = None) -> None:
+    def __init__(self, router: Router, *, static: Optional[Any] = None, api_token: Optional[str] = None) -> None:
         self.router = router
+        # Optional shared bearer token for /api/* (except /api/health, the
+        # liveness probe). None keeps the original unauthenticated,
+        # loopback-by-default "single trusted team" model.
+        self.api_token = api_token
         # Optional `cyberjection.api.static.DashboardStatic`: serves the
         # built dashboard for any non-`/api` path no route matched.
         self.static = static
@@ -160,6 +169,19 @@ class ASGIApp:
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
+    def _authorized(self, scope: Dict[str, Any]) -> bool:
+        if not self.api_token:
+            return True
+        header = b""
+        for name, value in scope.get("headers") or []:
+            if name.lower() == b"authorization":
+                header = value
+                break
+        scheme, _, supplied = header.decode("latin-1").partition(" ")
+        if scheme.lower() != "bearer" or not supplied:
+            return False
+        return hmac.compare_digest(supplied.strip().encode(), self.api_token.encode())
+
     async def _handle_http(self, scope: Dict[str, Any], receive: Receive, send: Send) -> None:
         method = scope["method"]
         path = scope["path"]
@@ -167,7 +189,10 @@ class ASGIApp:
 
         matched = self.router.match(method, path)
         is_api = path == "/api" or path.startswith("/api/")
-        if matched is None and self.static is not None and not is_api:
+        if is_api and path != "/api/health" and not self._authorized(scope):
+            response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            response.headers.append(("www-authenticate", 'Bearer realm="cyberjection"'))
+        elif matched is None and self.static is not None and not is_api:
             response = self.static.response_for(method, path)
         elif matched is None:
             response = JSONResponse({"error": "not_found", "path": path}, status_code=404)
@@ -176,8 +201,12 @@ class ASGIApp:
             request = Request(method=method, path=path, path_params=path_params, query_params=query_params)
             try:
                 response = await handler(request)
-            except Exception as exc:  # noqa: BLE001 - last-resort handler boundary
-                response = JSONResponse({"error": "internal_error", "detail": str(exc)}, status_code=500)
+            except Exception:  # noqa: BLE001 - last-resort handler boundary
+                # The exception text can contain database paths or SQL, so it
+                # goes to the server log only; the client gets a reference id.
+                incident = uuid.uuid4().hex[:12]
+                logger.exception("Unhandled error in %s %s (incident %s)", method, path, incident)
+                response = JSONResponse({"error": "internal_error", "incident": incident}, status_code=500)
 
         await send(
             {

@@ -233,12 +233,14 @@ class DistributedRateLimiter:
 
         if self._script_sha is None:
             self._script_sha = await self.redis.script_load(DUAL_TOKEN_BUCKET_LUA)
-            expected = hashlib.sha1(DUAL_TOKEN_BUCKET_LUA.encode("utf-8")).hexdigest()
+            # Redis identifies scripts by SHA-1; this is an identifier, not security.
+            expected = hashlib.sha1(DUAL_TOKEN_BUCKET_LUA.encode("utf-8"), usedforsecurity=False).hexdigest()
             # redis-py's script_load already returns the server's own
             # SHA1 of the script body; this assertion just documents (and
             # would catch, if it ever regressed) that the client-side
             # constant above matches what the server actually hashed.
-            assert self._script_sha == expected, "script SHA mismatch: DUAL_TOKEN_BUCKET_LUA text changed?"
+            if self._script_sha != expected:  # not an assert: must survive `python -O`
+                raise RuntimeError("script SHA mismatch: DUAL_TOKEN_BUCKET_LUA text changed?")
 
         while True:
             now = time.time()

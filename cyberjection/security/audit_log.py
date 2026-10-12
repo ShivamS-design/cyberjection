@@ -17,7 +17,9 @@ beyond the standard library.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -65,9 +67,24 @@ def _canonical_json(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _compute_hash(prev_hash: str, payload: Dict[str, Any]) -> str:
-    digest_input = prev_hash + _canonical_json(payload)
-    return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+HMAC_ALG = "hmac-sha256"
+
+
+def _compute_hash(prev_hash: str, payload: Dict[str, Any], key: Optional[bytes] = None) -> str:
+    """Plain SHA-256 makes the chain tamper-*evident* only: anyone who can
+    write the file can recompute a valid chain. With a `key` (kept outside
+    the log, e.g. `CYBERJECTION_AUDIT_KEY`), each link is an HMAC, so a
+    rewritten chain can't be made to verify without the key."""
+
+    digest_input = (prev_hash + _canonical_json(payload)).encode("utf-8")
+    if key:
+        return hmac.new(key, digest_input, hashlib.sha256).hexdigest()
+    return hashlib.sha256(digest_input).hexdigest()
+
+
+def key_from_env(var: str = "CYBERJECTION_AUDIT_KEY") -> Optional[bytes]:
+    value = os.environ.get(var)
+    return value.encode("utf-8") if value else None
 
 
 class AuditLogger:
@@ -81,9 +98,10 @@ class AuditLogger:
     across processes without a file lock this class doesn't take.
     """
 
-    def __init__(self, log_path: "Path | str") -> None:
+    def __init__(self, log_path: "Path | str", *, key: Optional[bytes] = None) -> None:
         self.log_path = Path(log_path)
         self._lock = threading.Lock()
+        self._key = key
 
     def log(
         self,
@@ -103,8 +121,10 @@ class AuditLogger:
         )
         with self._lock:
             prev_hash = self._last_hash()
-            entry_hash = _compute_hash(prev_hash, event.canonical_payload())
+            entry_hash = _compute_hash(prev_hash, event.canonical_payload(), self._key)
             record = {**event.canonical_payload(), "prev_hash": prev_hash, "entry_hash": entry_hash}
+            if self._key:
+                record["chain_alg"] = HMAC_ALG
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.log_path.open("a", encoding="utf-8") as f:
                 f.write(_canonical_json(record) + "\n")
@@ -141,7 +161,7 @@ class ChainVerificationResult:
     reason: Optional[str] = None
 
 
-def verify_chain(log_path: "Path | str") -> ChainVerificationResult:
+def verify_chain(log_path: "Path | str", *, key: Optional[bytes] = None) -> ChainVerificationResult:
     """Re-walks every entry in `log_path`, recomputing each entry's hash
     from its own payload and the previous entry's recorded hash, and
     confirms it matches what was stored. Returns as soon as the first
@@ -164,7 +184,24 @@ def verify_chain(log_path: "Path | str") -> ChainVerificationResult:
             record = json.loads(stripped)
             recorded_prev = record.get("prev_hash")
             recorded_hash = record.get("entry_hash")
-            payload = {k: v for k, v in record.items() if k not in ("prev_hash", "entry_hash")}
+            payload = {k: v for k, v in record.items() if k not in ("prev_hash", "entry_hash", "chain_alg")}
+            keyed = record.get("chain_alg") == HMAC_ALG
+            if keyed and not key:
+                return ChainVerificationResult(
+                    valid=False,
+                    entries_checked=count,
+                    first_broken_index=index,
+                    reason=f"entry {index} is HMAC-keyed; supply the key to verify it",
+                )
+            if key and not keyed:
+                # With a key, every entry must be keyed: otherwise an attacker
+                # could replace the log with a freshly computed unkeyed chain.
+                return ChainVerificationResult(
+                    valid=False,
+                    entries_checked=count,
+                    first_broken_index=index,
+                    reason=f"entry {index} is not HMAC-keyed (possible downgrade/rewrite)",
+                )
 
             if recorded_prev != expected_prev:
                 return ChainVerificationResult(
@@ -177,7 +214,7 @@ def verify_chain(log_path: "Path | str") -> ChainVerificationResult:
                     ),
                 )
 
-            recomputed = _compute_hash(expected_prev, payload)
+            recomputed = _compute_hash(expected_prev, payload, key if keyed else None)
             if recomputed != recorded_hash:
                 return ChainVerificationResult(
                     valid=False,

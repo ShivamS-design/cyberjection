@@ -23,7 +23,12 @@ class UvicornUnavailableError(RuntimeError):
 
 
 def run_server(
-    *, host: str = "127.0.0.1", port: int = 8000, db_url: Optional[str] = None, dashboard_dir: Optional[str] = None
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    db_url: Optional[str] = None,
+    dashboard_dir: Optional[str] = None,
+    api_token: Optional[str] = None,
 ) -> None:
     """Builds the dashboard API app and serves it with `uvicorn.run`.
     Blocks until the server is stopped (Ctrl+C / SIGTERM). Raises
@@ -42,5 +47,5 @@ def run_server(
 
     from cyberjection.api.app import build_app
 
-    app = build_app(db_url=db_url, dashboard_dir=dashboard_dir)
+    app = build_app(db_url=db_url, dashboard_dir=dashboard_dir, api_token=api_token)
     uvicorn.run(app, host=host, port=port)

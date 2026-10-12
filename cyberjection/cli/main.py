@@ -51,7 +51,8 @@ from cyberjection.reporting import (
     resolve_threshold,
 )
 from cyberjection.reporting import registry as exporter_registry
-from cyberjection.security.audit_log import AuditLogger
+from cyberjection.security.audit_log import AuditLogger, verify_chain
+from cyberjection.security.audit_log import key_from_env as audit_key_from_env
 from cyberjection.security.compliance import compliance_summary, generate_compliance_report
 from cyberjection.security.dependency_audit import evaluate_dependency_gate, run_dependency_audit
 from cyberjection.security.input_validation import assert_safe_output_path, assert_safe_target_url
@@ -81,7 +82,11 @@ console = Console()
 # location; defaults alongside the SQLite results DB's own default
 # directory, matching the `.cyberjection/` convention `DatabaseManager`
 # already established.
-_audit_logger = AuditLogger(os.environ.get("CYBERJECTION_AUDIT_LOG", ".cyberjection/audit.jsonl"))
+# CYBERJECTION_AUDIT_KEY (optional) turns the hash chain into an HMAC chain
+# that can't be recomputed by someone who can only write the log file.
+_audit_logger = AuditLogger(
+    os.environ.get("CYBERJECTION_AUDIT_LOG", ".cyberjection/audit.jsonl"), key=audit_key_from_env()
+)
 
 # Exit codes, documented once here rather than as magic numbers scattered
 # through each command: 0 success, 1 a quality-gate failure (the run
@@ -443,6 +448,11 @@ def run_audit(
         "--fail-on-unavailable",
         help="Fail the dependency gate if pip-audit isn't installed (recommended for CI)",
     ),
+    verify_log: bool = typer.Option(
+        False,
+        "--verify-log",
+        help="Verify the audit log's hash chain (uses CYBERJECTION_AUDIT_KEY if set)",
+    ),
 ) -> None:
     """Run security-hardening checks: dependency vulnerabilities, hardcoded
     secrets, target URL safety, and/or the compliance control summary.
@@ -466,12 +476,29 @@ def run_audit(
         },
     )
 
-    if not any([check_deps, check_secrets, check_targets, show_compliance]):
+    if verify_log:
+        log_path = _audit_logger.log_path
+        result = verify_chain(log_path, key=audit_key_from_env())
+        if result.valid:
+            console.print(
+                f"[bold green]Audit log intact:[/bold green] {result.entries_checked} entries verified "
+                f"in {escape(str(log_path))}"
+            )
+        else:
+            console.print(
+                f"[bold red]Audit log verification FAILED[/bold red] at entry {result.first_broken_index}: "
+                f"{escape(str(result.reason))}"
+            )
+        overall_log_ok = result.valid
+    else:
+        overall_log_ok = True
+
+    if not any([check_deps, check_secrets, check_targets, show_compliance]) and not verify_log:
         check_deps = True
         check_secrets = True
 
     report_sections: List[str] = []
-    overall_ok = True
+    overall_ok = overall_log_ok
 
     if check_deps:
         console.print("[bold blue]Running dependency vulnerability audit...[/bold blue]")
@@ -643,6 +670,14 @@ def serve_dashboard_api(
         envvar="CYBERJECTION_DASHBOARD_DIR",
         help="Also serve the built web dashboard (apps/dashboard/dist) from the same origin",
     ),
+    api_token: Optional[str] = typer.Option(
+        None,
+        "--api-token",
+        envvar="CYBERJECTION_API_TOKEN",
+        help="Require 'Authorization: Bearer <token>' on /api/* (prefer the env var: "
+        "command-line arguments are visible to other local users)",
+        show_default=False,
+    ),
 ) -> None:
     """Serve the Phase 10 dashboard REST API (`cyberjection.api`) for
     `apps/dashboard` -- or any other HTTP client -- to consume.
@@ -660,8 +695,22 @@ def serve_dashboard_api(
     console.print(f"[bold blue]Cyberjection dashboard API[/bold blue] starting on {host}:{port}")
     if dashboard_dir is not None:
         console.print(f"[bold blue]Serving dashboard from[/bold blue] {escape(str(dashboard_dir))}")
+    if api_token:
+        console.print("[bold green]API authentication enabled[/bold green] (bearer token).")
+    elif host not in ("127.0.0.1", "::1", "localhost"):
+        console.print(
+            f"[bold yellow]WARNING:[/bold yellow] serving on {escape(host)} with no authentication. "
+            "Anyone who can reach this port can read campaign history. Set CYBERJECTION_API_TOKEN "
+            "or put an authenticating reverse proxy in front (see docs/DEPLOYMENT.md)."
+        )
     try:
-        run_server(host=host, port=port, db_url=db_url, dashboard_dir=str(dashboard_dir) if dashboard_dir else None)
+        run_server(
+            host=host,
+            port=port,
+            db_url=db_url,
+            dashboard_dir=str(dashboard_dir) if dashboard_dir else None,
+            api_token=api_token,
+        )
     except DashboardNotBuiltError as exc:
         console.print(f"[bold red]Cannot serve dashboard:[/bold red] {escape(str(exc))}")
         _audit_logger.log("cli.serve.dashboard_missing", outcome="failure")

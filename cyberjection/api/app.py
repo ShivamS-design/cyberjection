@@ -96,7 +96,11 @@ def _test_detail(test: Any) -> Dict[str, Any]:
 
 
 def build_app(
-    db_url: Optional[str] = None, *, manager: Optional[Any] = None, dashboard_dir: Optional[str] = None
+    db_url: Optional[str] = None,
+    *,
+    manager: Optional[Any] = None,
+    dashboard_dir: Optional[str] = None,
+    api_token: Optional[str] = None,
 ) -> ASGIApp:
     """Builds the dashboard API's `ASGIApp`.
 
@@ -148,7 +152,11 @@ def build_app(
         # Best-effort: a broken third-party plugin is reported alongside
         # the successfully loaded ones rather than failing the whole
         # request (see cyberjection.plugins.loader's module docstring).
-        discovery = discover_plugins()
+        # Discovery imports third-party code, so it runs once per process,
+        # not on every GET.
+        if state.get("discovery") is None:
+            state["discovery"] = discover_plugins()
+        discovery = state["discovery"]
         return JSONResponse(
             {
                 "registered": known_aliases_by_group(),
@@ -219,4 +227,4 @@ def build_app(
         from cyberjection.api.static import DashboardStatic
 
         static = DashboardStatic(dashboard_dir)
-    return ASGIApp(router, static=static)
+    return ASGIApp(router, static=static, api_token=api_token or None)

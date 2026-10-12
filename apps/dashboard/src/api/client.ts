@@ -17,8 +17,38 @@ export class ApiError extends Error {
   }
 }
 
+// When the server runs with CYBERJECTION_API_TOKEN, /api/* requires a bearer
+// token. It is asked for once and kept in sessionStorage (this tab only,
+// cleared when the tab closes) -- never in localStorage or the URL.
+const TOKEN_KEY = "cyberjection.apiToken";
+
+function storedToken(): string | null {
+  try {
+    return window.sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+async function request(path: string): Promise<Response> {
+  const token = storedToken();
+  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+  return fetch(`${API_BASE}${path}`, { headers });
+}
+
 async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`);
+  let response = await request(path);
+  if (response.status === 401) {
+    const entered = window.prompt("This Cyberjection server requires an API token:");
+    if (entered) {
+      try {
+        window.sessionStorage.setItem(TOKEN_KEY, entered.trim());
+      } catch {
+        // storage unavailable: the token is used for this request only
+      }
+      response = await request(path);
+    }
+  }
   const contentType = response.headers.get("content-type") ?? "";
   const body = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
