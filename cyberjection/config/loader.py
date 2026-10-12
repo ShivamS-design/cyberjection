@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import yaml
 from pydantic import ValidationError
@@ -80,7 +80,7 @@ def expand_env_vars(raw_text: str, *, strict: bool = True, env: Optional[Dict[st
     return substituted
 
 
-def _parse_yaml(text: str, *, source: str) -> dict:
+def _parse_yaml(text: str, *, source: str) -> Dict[str, Any]:
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:

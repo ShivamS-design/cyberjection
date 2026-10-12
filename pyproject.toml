@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cyberjection"
-version = "0.10.0"
+version = "0.11.0"
 description = "Enterprise-grade asynchronous LLM red-teaming and security orchestration framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,7 +28,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "alembic>=1.13",
     "greenlet>=3.0",
-    "redis>=5.0",
+    "redis>=5.0.1",  # 5.0.1 introduced aclose(), which replaces the deprecated close()
     "celery>=5.4",
 ]
 
@@ -39,9 +39,15 @@ dev = [
     "pytest-cov>=5.0",
     "mypy>=1.10",
     "types-PyYAML",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "fakeredis[lua]>=2.23",
 ]
 onnx = [
     "onnxruntime>=1.17",
+]
+weights = [
+    "numpy>=1.26",
 ]
 security = [
     "pip-audit>=2.7",

@@ -650,7 +650,7 @@ locally, concurrency-bounded by `max_workers` via an `asyncio.Semaphore`,
 not dispatched to Celery workers. Real distributed dispatch remains a
 documented follow-up.
 
-## Phase 10: Plugin Architecture, Web Dashboard, Container Deployment
+## Phase 10: Plugin Architecture & Web Dashboard
 
 Three largely independent additions, all building on infrastructure
 earlier phases deliberately left ready for them (the presentation-layer
@@ -666,7 +666,7 @@ back it):
 | `cyberjection/api/` | `cyberjection.api.asgi`: a dependency-free ASGI 3.0 toolkit (router, request/response, lifespan handling) built on nothing but the standard library. `cyberjection.api.app`: five read-only REST endpoints over the Phase 4 persistence layer and the plugin registries. `cyberjection.api.server`: the `uvicorn`-backed entrypoint (`uvicorn` is an optional extra, not a hard dependency of the app itself). |
 | `cyberjection/cli/main.py` (`plugins`, `serve` commands) | `plugins`: lists every registered alias by group, including anything `discover_plugins()` found this run. `serve`: runs the dashboard API under `uvicorn`; reports a clear environment error (matching `inspect`'s SQLAlchemy-unavailable path) if `uvicorn` isn't installed. |
 | `apps/dashboard/` | A Vite + React + TypeScript single-page app: a campaign list, a campaign detail view (its test cases), a test detail view (full conversation transcript, metrics, findings), and a plugins page -- all talking to `cyberjection.api`'s REST endpoints via relative `/api/...` fetches. |
-| `Dockerfile`, `apps/dashboard/Dockerfile`, `docker-compose.yml` | Multi-stage container images for the API/CLI (Python) and the dashboard (Node build -> nginx serve), composed together for the single-instance deployment model `docs/DEPLOYMENT.md` describes. |
+| `cyberjection/api/static.py` (added in 0.11.0) | Serves the built dashboard from the same process and origin as the API (`cyberjection serve --dashboard-dir`), with SPA fallback, traversal protection and security headers. Replaced the container images and nginx proxy that Phase 10 originally shipped, which were removed in 0.11.0. |
 
 ### Why the API isn't built on FastAPI
 
@@ -714,6 +714,88 @@ mandatory, not optional -- see `docs/COMPLIANCE.md`'s now-`PARTIAL`
 authentication controls) is a documented follow-up, not part of this
 phase.
 
+## Phase 11: HubGuard & Model Supply Chain Security
+
+Phases 1-10 test what a model *says*. Phase 11 vets what a model
+repository *is* before it is loaded, because on the Hugging Face Hub the
+dangerous moment is often `from_pretrained()` itself: a legacy
+`pytorch_model.bin` is a pickle, `torch.load` is `pickle.load`, and
+`trust_remote_code=True` imports whatever Python the repository author
+shipped.
+
+| Module | Responsibility |
+|---|---|
+| `cyberjection/hubguard/client.py` | `HubGuardClient.audit_repository()`: resolves the revision to a commit SHA, runs every scanner concurrently in worker threads, and folds the results into one `HubGuardReport`. `generate_manifest()` pins file hashes. |
+| `cyberjection/hubguard/transport.py` | Read-only repository access: `HTTPHubTransport` (stdlib `urllib`, Range requests, token scoped to the Hub host) and `LocalDirectoryTransport` (snapshot directories, symlink escapes refused). `RangeFile` makes ranged reads seekable. |
+| `cyberjection/hubguard/picklescan.py` | Static opcode scan of pickle, PyTorch ZIP/legacy, `.npy` and `.npz` files via `pickletools.genops` and a symbolic stack -- nothing is ever unpickled. |
+| `cyberjection/hubguard/remotecode.py` | AST analysis of `trust_remote_code` Python, with alias-following name resolution and recursive analysis of `exec`/`eval` payloads; `auto_map` parsing including cross-repository references. |
+| `cyberjection/hubguard/sandbox.py` | Opt-in behavioral profiler: imports remote code in an isolated child interpreter under PEP 578 audit hooks (deny + record), POSIX rlimits and, where available, a network namespace. |
+| `cyberjection/hubguard/safetensors.py` | SafeTensors-only policy (`EnforcementLevel`), strict header validation, `HashManifest`, SHA-256 and Git blob SHA-1 helpers. |
+| `cyberjection/hubguard/secrets.py` | Credential / webhook / internal-endpoint detection for third-party artifacts, judged per matched value, always redacted. |
+| `cyberjection/hubguard/weightscan.py` | Tensor statistics read straight from SafeTensors, embedding-norm outliers as trigger candidates, and `TriggerProbe`, a differential backdoor-trigger probe over any Phase 1 `BaseTarget`. |
+| `cyberjection/hubguard/models.py` | `HubFinding`, `HubGuardReport`, `Severity`, `Verdict`, the risk-score formula, and the adapter to Phase 6 `reporting.Finding`. |
+| `cyberjection/hubguard/gate.py` | `gate_campaign()`: audits every `huggingface` target under a campaign's `hubguard:` policy; `cyberjection run` calls it before any prompt is sent. |
+
+### Pipeline
+
+```
+repo_id@revision ──► resolve to commit SHA (all later reads pinned to it)
+                     │
+                     ├─ provenance / org allowlist / disabled repo
+                     ├─ SafeTensors-only format policy (file listing only)
+                     ├─ per file, concurrently:
+                     │    *.safetensors ─► header validation (2 range reads) [─► tensor stats]
+                     │    pickle formats ─► opcode scan (ZIP: only data.pkl is fetched)
+                     │    *.py           ─► AST analysis              [─► sandbox profile]
+                     ├─ auto_map (config.json, tokenizer_config.json, ...)
+                     ├─ secrets: text files at HEAD + commit messages + earlier revisions
+                     ├─ integrity: git blob SHA-1, manifest SHA-256 [, full-download SHA-256]
+                     └─ [trigger probe through a Phase 1 target]
+                     ▼
+            HubGuardReport(verdict, risk_score, findings, files)
+```
+
+### Static, never dynamic, by default
+
+Every scanner except the opt-in sandbox works on bytes and syntax trees.
+`pickletools.genops` decodes opcodes without executing them; `ast.parse`
+builds a tree without running it; SafeTensors validation is JSON parsing.
+That's the property that makes it safe to point HubGuard at a repository
+you already suspect is malicious. The sandbox is the one component that
+runs untrusted code, and it is off unless `profile_remote_code` /
+`--profile-remote-code` is set.
+
+### Fail closed
+
+A file that can't be read, parsed, or fully scanned becomes a HIGH
+`scan_error` (or format-specific "unparseable") finding, and the report
+is marked `incomplete`. An incomplete report can never be `PASS`, and
+with the default `max_allowed_risk_score` of 7.0 it is `BLOCK`. The same
+rule is used inside the scanners: a `STACK_GLOBAL` whose operands can't be
+resolved to constants is CRITICAL, not ignored; a Python file that won't
+parse is HIGH, not skipped.
+
+### Risk score and verdict
+
+Each severity has a weight on the Phase 6 0-10 scale (INFO 0, LOW 2,
+MEDIUM 4.5, HIGH 7.5, CRITICAL 10). The score is the worst finding's
+weight plus 10% of the others', capped at 10, so it is monotone and
+predictable by hand. The verdict is `BLOCK` if any finding is *blocking*
+(every CRITICAL, plus policy and integrity violations) or the score
+exceeds `max_allowed_risk_score`; `WARN` if anything at LOW or above
+remains; `PASS` otherwise.
+
+### Why range reads matter
+
+A 15 GB `pytorch_model.bin` is a ZIP whose code-bearing part is a
+kilobyte-scale `data.pkl`. `RangeFile` wraps HTTP Range requests in a
+seekable file object, so `zipfile` reads the central directory from the
+end of the file and then only the `data.pkl` member; the tensor storage
+is never downloaded. SafeTensors validation is two range reads (the
+8-byte length, then the header). Resolved CDN URLs are cached per file so
+repeated ranges skip the redirect hop, and the bearer token is only ever
+attached to requests whose host is the Hub endpoint.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -726,8 +808,9 @@ phase.
 | 6 | CI/CD pipeline integration, CLI harness (Typer + Rich), enterprise reporting (SARIF, JSON, Markdown) |
 | 7 | Distributed worker architecture: Celery + Redis task queues, atomic cluster-wide RPM/TPM rate limiting, Pub/Sub abort coordination, retry/dead-letter fault tolerance |
 | 8 | Security auditing, compliance & production hardening: output-path/SSRF/payload-size guards, hash-chained audit log, secrets/dependency scanning, ASVS/SOC2 control self-assessment |
-| 9 (current) | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack; distributed-queue dispatch and `max_cost_cap` enforcement remain explicit follow-ups |
-| 10 | Plugin architecture, web dashboard, container deployment |
+| 9 | Orchestrator: wires the CLI's `run` pipeline stub through the real attack/evaluator/persistence stack; distributed-queue dispatch and `max_cost_cap` enforcement remain explicit follow-ups |
+| 10 | Plugin architecture, web dashboard (container images removed in 0.11.0; `serve --dashboard-dir` serves the dashboard instead) |
+| 11 (current) | HubGuard model supply-chain security: pickle opcode scanning, remote-code static analysis and sandboxed profiling, SafeTensors enforcement and hash manifests, repository secret/history scanning, weight anomaly checks and backdoor trigger probing, campaign gate |
 
 ## Data model
 

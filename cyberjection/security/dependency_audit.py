@@ -21,9 +21,11 @@ the situation this module was developed and tested in.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -96,6 +98,20 @@ def _count_packages(raw_json: str) -> int:
     return len(data.get("dependencies", []))
 
 
+def _pip_audit_command() -> Optional[List[str]]:
+    """How to invoke pip-audit, preferring the copy installed alongside
+    this interpreter (`python -m pip_audit`). Looking only on `PATH` missed
+    a correctly installed pip-audit whenever Cyberjection ran from an
+    unactivated virtualenv (`venv/bin/cyberjection`, `python -m ...`), and
+    could audit a *different* environment's packages if another pip-audit
+    happened to be on `PATH`."""
+
+    if importlib.util.find_spec("pip_audit") is not None:
+        return [sys.executable, "-m", "pip_audit"]
+    executable = shutil.which("pip-audit")
+    return [executable] if executable else None
+
+
 def run_dependency_audit(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> DependencyAuditReport:
     """Runs the real `pip-audit` CLI against the current environment's
     installed packages, if it's on `PATH`.
@@ -109,8 +125,8 @@ def run_dependency_audit(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> D
     when the environment is clean.
     """
 
-    executable = shutil.which("pip-audit")
-    if executable is None:
+    command = _pip_audit_command()
+    if command is None:
         return DependencyAuditReport(
             findings=[],
             source="unavailable",
@@ -120,7 +136,7 @@ def run_dependency_audit(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> D
 
     try:
         result = subprocess.run(
-            [executable, "--format", "json"],
+            [*command, "--format", "json"],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,

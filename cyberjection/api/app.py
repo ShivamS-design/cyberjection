@@ -95,7 +95,9 @@ def _test_detail(test: Any) -> Dict[str, Any]:
     return payload
 
 
-def build_app(db_url: Optional[str] = None, *, manager: Optional[Any] = None) -> ASGIApp:
+def build_app(
+    db_url: Optional[str] = None, *, manager: Optional[Any] = None, dashboard_dir: Optional[str] = None
+) -> ASGIApp:
     """Builds the dashboard API's `ASGIApp`.
 
     Opening the database (if SQLAlchemy is installed) is deferred to the
@@ -108,12 +110,16 @@ def build_app(db_url: Optional[str] = None, *, manager: Optional[Any] = None) ->
     point the app at a pre-seeded in-memory database
     (`DatabaseManager.in_memory()`) instead of a throwaway file-backed one
     `db_url` would otherwise create.
+
+    `dashboard_dir` (a built `apps/dashboard/dist`) additionally serves the
+    web dashboard from the same origin -- see `cyberjection.api.static`.
+    Raises `DashboardNotBuiltError` if it has no `index.html`.
     """
 
     router = Router()
     state: Dict[str, Any] = {"db_url": db_url, "manager": manager, "initialized": manager is not None}
 
-    async def _get_manager():
+    async def _get_manager() -> Optional[Any]:
         from cyberjection.persistence import _SQLALCHEMY_AVAILABLE, DatabaseManager, DEFAULT_DB_URL
 
         if not _SQLALCHEMY_AVAILABLE:
@@ -208,4 +214,9 @@ def build_app(db_url: Optional[str] = None, *, manager: Optional[Any] = None) ->
     router.add_route("GET", "/api/campaigns/{campaign_id}/tests/{test_id}", get_test)
     router.add_route("GET", "/api/campaigns/{campaign_id}", get_campaign)
 
-    return ASGIApp(router)
+    static = None
+    if dashboard_dir is not None:
+        from cyberjection.api.static import DashboardStatic
+
+        static = DashboardStatic(dashboard_dir)
+    return ASGIApp(router, static=static)

@@ -109,7 +109,7 @@ class ConversationContext(BaseModel):
 
         path: List[AttackNode] = []
         current: Optional[str] = node_id
-        seen: set = set()
+        seen: "set[str]" = set()
         while current is not None:
             if current in seen:
                 break  # Defensive: a cyclic parent_id chain should never

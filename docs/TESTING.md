@@ -64,11 +64,14 @@ Unlike the Phase 4/6 suites above, none of these four files
 `pyproject.toml`), and `test_rate_limiter.py`/`test_coordinator.py`/
 `test_distributed_tasks.py` exercise `DistributedRateLimiter`,
 `DistributedClusterCoordinator`, and the Celery task directly through the
-real `redis.asyncio`/`celery` import surface. Running them against a real
-deployment requires a reachable Redis instance (`docker run -d --name
-cyberjection-redis -p 6379:6379 redis:alpine`, matching the Phase 7 spec's
-own prerequisite); `test_retry.py`'s pure backoff/payload-builder tests
-need neither Redis nor Celery and always run.
+real `redis.asyncio`/`celery` import surface. No Redis server is needed:
+the autouse `_redis_backend` fixture in `tests/conftest.py` routes every
+`redis.asyncio.from_url` call to an in-memory `fakeredis` server (one per
+host/port/db, so the tests' distinct hostnames stay isolated), and
+`fakeredis[lua]` executes the rate limiter's real Lua script, so atomicity
+is still genuinely tested. To run them against a real server instead, set
+`CYBERJECTION_TEST_REDIS_URL=redis://host:6379`. `test_retry.py`'s pure
+backoff/payload-builder tests need neither Redis nor Celery.
 
 To run only the Phase 8 suite:
 
@@ -180,6 +183,14 @@ deployment.
 | `tests/unit/test_plugins.py` | `cyberjection.plugins.loader.discover_plugins`: successful load-and-register across all four plugin groups against fake `_FakeEntryPoint` objects, per-loaded-plugin metadata (group/alias/qualified_name/obj), non-fatal failure on a wrong-base-type plugin or a `load()` that raises (one bad plugin doesn't block the others in the same group), `strict=True` raising on first failure instead of collecting, an unknown plugin group, and `known_aliases_by_group`'s four-group shape and sorted output. |
 | `tests/unit/test_api.py` | `cyberjection.api.asgi`: `Router` path-param matching (including that a param can't cross a `/` boundary, and that a more-specific route registered first wins), `Request.query_int`'s malformed-input fallback, ASGI `lifespan` startup/shutdown handshake, unmatched-route 404, handler-exception 500, and query-string parsing. `cyberjection.api.app`: `/api/health`, `/api/plugins` (built-in aliases present, empty discovery/failures), and the `/api/campaigns*` 503 "persistence unavailable" path (via a monkeypatched `_SQLALCHEMY_AVAILABLE`). Uses a hand-rolled ASGI test client (`_call_asgi_app`) rather than `httpx`/`starlette.testclient`, neither of which is a project dependency. |
 | `tests/unit/test_api_persistence.py` | The same `/api/campaigns*` endpoints' happy path against a real in-memory database (`DatabaseManager.in_memory()`, wired into `build_app`'s `manager=` parameter): campaign listing, campaign detail with its tests, unknown-campaign 404, test detail with turns/metrics, and the "test id right, campaign id wrong" and unknown-test-id 404 cases. Requires `sqlalchemy` + `aiosqlite`; self-skips otherwise (kept in its own module, not a class inside `test_api.py`, specifically so the whole file module-skips the same way `test_database_models.py`/`test_repository.py` already do, rather than relying on a class-scoped fixture the offline test runner's fixture resolver doesn't collect). |
+| `tests/unit/test_hubguard_picklescan.py` | Phase 11 pickle scanner: `classify_global` deny/gadget/allow tables (including Python 2 aliases and dotted-name traversal), `os.system` payloads at every pickle protocol 0-5, memoized `STACK_GLOBAL` operand resolution, unresolvable-import fail-closed, nested pickles in bytes and base64, embedded-code analysis, `EXT*`/`INST` opcodes, PyTorch ZIP/legacy/`.npy`/`.npz` containers, benign state dicts staying clean, and a sentinel proving no scan path ever unpickles. |
+| `tests/unit/test_hubguard_remotecode.py` | Remote-code AST analysis: every process-execution spelling (aliases, `from` imports, `__import__`, `importlib`, `getattr`), network/filesystem/deserialization/credential rules, module-level vs function-level severity, obfuscated `exec` chains, recursive analysis of `exec` payloads (the real `totally-harmless-model` payload shape), parse-failure fail-closed, and `auto_map` parsing including cross-repository references. |
+| `tests/unit/test_hubguard_sandbox.py` | The opt-in profiler against hostile modules, verified by real side effects: shell/subprocess spawns leave no marker file, a listening socket never receives a connection, DNS, writes, credential reads, `ctypes` and audit-hook tampering are denied; environment scrubbing (no `HF_TOKEN`), forged-event resistance, timeouts, and path-traversal file names. |
+| `tests/unit/test_hubguard_safetensors.py` | Header validation (every structural, dtype, shape, offset, gap/overlap/trailing-data case), a differential test against the reference `safetensors` loader (identical verdicts except duplicate keys, which only HubGuard rejects), the format policy at each `EnforcementLevel`, Git blob SHA-1 against a known `git hash-object` value, and `HashManifest` round-trips and comparison. |
+| `tests/unit/test_hubguard_secrets.py` | Every credential/webhook/internal-URL pattern (fixtures assembled from fragments so the file itself doesn't trip secret scanners), redaction, specific-over-generic precedence, placeholder suppression, and that a real key on a line mentioning "example" is still found. |
+| `tests/unit/test_hubguard_weightscan.py` | Float decoding (F32/F64/F16/BF16), non-finite and outlier tensor detection, sampling caps, embedding-outlier rows (NumPy, self-skips without it), tokenizer vocab parsing, and `TriggerProbe` against fake Phase 1 targets: clean, noisy, backdoored, statically-nominated triggers, and an insertion-sensitive model that must *not* be flagged. |
+| `tests/unit/test_hubguard_client.py` | `HubGuardClient` end to end over local snapshots and `FakeHub`, a real localhost HTTP server: clean PASS, malicious BLOCK across every category, org allowlist, risk ceiling, manifests and tampering, sandbox and weight/probe stages, audit-log chaining, the SARIF adapter, token-not-forwarded-to-CDN, commit-SHA pinning, range-read efficiency on a large checkpoint, servers that ignore `Range`, secrets in Git history, blob/LFS mismatches, fail-closed on missing repos and unreadable files, and the campaign gate. |
+| `tests/unit/test_hubguard_cli_config.py` | The `hubguard:` campaign section and its load-time policy checks, `examples/hubguard_campaign.yaml`, the LiteLLM `huggingface/` prefix fix, every `cyberjection hubguard` subcommand and exit code, and `cyberjection run` refusing to execute a campaign against a BLOCKed target. |
 | `tests/conftest.py` | Shared fixtures: a temp-file YAML writer and an environment-cleaning fixture for tests that need to assert on missing variables. |
 
 ## Conventions

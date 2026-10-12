@@ -1,8 +1,8 @@
 // TypeScript mirrors of the JSON shapes cyberjection.api.app's handlers
 // return (see that module's docstring for the endpoint list). Kept as
 // plain interfaces rather than a schema-validation library (zod, etc.) --
-// the backend and frontend are versioned and deployed together (see
-// apps/dashboard/Dockerfile and the repo-root docker-compose.yml), so a
+// the backend and frontend are versioned and deployed together (one
+// `cyberjection serve --dashboard-dir` process serves both), so a
 // shape mismatch is a build-time/integration concern this project catches
 // via cyberjection.api's own test suite (tests/unit/test_api.py,
 // tests/unit/test_api_persistence.py), not something the dashboard needs
